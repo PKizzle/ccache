@@ -92,6 +92,7 @@ public:
   uint64_t max_size() const;
   const std::string& msvc_dep_prefix() const;
   bool msvc_utf8() const;
+  bool msvc_version_probe() const;
   const std::string& path() const;
   bool pch_external_checksum() const;
   const std::string& prefix_command() const;
@@ -225,6 +226,7 @@ private:
   uint64_t m_max_size = 5ULL * 1024 * 1024 * 1024;
   std::string m_msvc_dep_prefix = "Note: including file:";
   bool m_msvc_utf8 = true;
+  bool m_msvc_version_probe = false;
   std::string m_path;
   bool m_pch_external_checksum = false;
   std::string m_prefix_command;
@@ -467,6 +469,12 @@ inline bool
 Config::msvc_utf8() const
 {
   return m_msvc_utf8;
+}
+
+inline bool
+Config::msvc_version_probe() const
+{
+  return m_msvc_version_probe;
 }
 
 inline const std::string&

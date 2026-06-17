@@ -136,6 +136,7 @@ enum class ConfigItem : uint8_t {
   max_size,
   msvc_dep_prefix,
   msvc_utf8,
+  msvc_version_probe,
   namespace_,
   path,
   pch_external_checksum,
@@ -206,6 +207,7 @@ const std::unordered_map<std::string_view, ConfigKeyTableEntry>
     {"max_size",                   {C::max_size,                   DCP::reject}},
     {"msvc_dep_prefix",            {C::msvc_dep_prefix,            DCP::allow}},
     {"msvc_utf8",                  {C::msvc_utf8,                  DCP::allow}},
+    {"msvc_version_probe",         {C::msvc_version_probe,         DCP::allow}},
     {"namespace",                  {C::namespace_,                 DCP::allow}},
     {"path",                       {C::path,                       DCP::unsafe}},
     {"pch_external_checksum",      {C::pch_external_checksum,      DCP::allow}},
@@ -262,6 +264,7 @@ const std::unordered_map<std::string_view, std::string_view>
     {"MAXSIZE",              "max_size"                  },
     {"MSVC_DEP_PREFIX",      "msvc_dep_prefix"           },
     {"MSVC_UTF8",            "msvc_utf8"                 },
+    {"MSVC_VERSION_PROBE",   "msvc_version_probe"        },
     {"NAMESPACE",            "namespace"                 },
     {"PATH",                 "path"                      },
     {"PCH_EXTSUM",           "pch_external_checksum"     },
@@ -1113,6 +1116,9 @@ Config::get_string_value(const std::string& key) const
   case ConfigItem::msvc_utf8:
     return format_bool(m_msvc_utf8);
 
+  case ConfigItem::msvc_version_probe:
+    return format_bool(m_msvc_version_probe);
+
   case ConfigItem::namespace_:
     return m_namespace;
 
@@ -1407,6 +1413,10 @@ Config::set_item(const std::string_view& key,
 
   case ConfigItem::msvc_utf8:
     m_msvc_utf8 = parse_bool(value, env_var_key, negate);
+    break;
+
+  case ConfigItem::msvc_version_probe:
+    m_msvc_version_probe = parse_bool(value, env_var_key, negate);
     break;
 
   case ConfigItem::namespace_:

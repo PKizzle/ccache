@@ -1884,6 +1884,42 @@ hash_common_info(const Context& ctx, const util::Args& args, Hash& hash)
         hash.hash(value);
       }
     }
+
+    // clang-cl does not necessarily derive its emulated MSVC version from the
+    // VCToolsVersion environment variable above: it may auto-detect the toolset,
+    // and its own built-in default _MSC_VER can change between LLVM releases.
+    // Since clang-cl embeds this version into the target triple stored in
+    // precompiled headers, a PCH built with one emulated MSVC version cannot be
+    // consumed by a translation unit compiled with another (clang-cl reports
+    // "AST file ... was compiled for the target ...msvcXX.YY.ZZZ" and aborts).
+    // Probe clang-cl for its predefined _MSC_* macros and hash them so the cache
+    // is invalidated when the emulated version drifts. This is only needed when
+    // *creating* a PCH: translation units that consume one already hash the PCH
+    // file's content (see check_included_pch_file), so a regenerated PCH
+    // transitively invalidates its consumers. Gating on generating_pch keeps the
+    // extra compiler invocation to the handful of PCH-owner compiles rather than
+    // every translation unit. The probe runs the compiler, which is contrary to
+    // ccache's default of staying out of the compilation hot path, so it is
+    // opt-in via the msvc_version_probe option.
+    if (ctx.config.msvc_version_probe()
+        && ctx.config.compiler_type() == CompilerType::clang_cl
+        && ctx.args_info.generating_pch) {
+      util::Args probe_args{
+        ctx.orig_args[0], "-Xclang", "-dM", "-E", "-x", "c++", "nul"};
+      const auto probe_output = util::exec_to_string(probe_args);
+      if (probe_output) {
+        for (const std::string_view line :
+             util::split_into_views(*probe_output, "\n")) {
+          if (line.find("_MSC_") != std::string_view::npos) {
+            hash.hash_delimiter("clang_cl_msc_version");
+            hash.hash(line);
+          }
+        }
+      } else {
+        LOG("Failed to probe clang-cl for its emulated MSVC version: {}",
+            probe_output.error());
+      }
+    }
   }
 #endif
 

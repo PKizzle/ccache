@@ -967,6 +967,22 @@ file in `/etc/rsyslog.d`:
     range for a given Windows system codepage which results in an invalid utf-8 sequence.
     The default is true.
 
+[#config_msvc_version_probe]
+*msvc_version_probe* (*CCACHE_MSVC_VERSION_PROBE*)::
+
+    If true, when *creating* a precompiled header with clang-cl, ccache runs the
+    compiler once to query its predefined `_MSC_*` macros and adds them to the
+    hash. clang-cl embeds the emulated MSVC version into the target triple stored
+    in the precompiled header, and that version can change without the clang-cl
+    binary itself changing (for example when the detected MSVC toolset is
+    updated), which would otherwise let ccache serve a stale precompiled header
+    that the consuming translation units refuse to load ("`AST file ... was
+    compiled for the target ...`"). Consuming translation units are unaffected by
+    this setting since they already hash the precompiled header's content. Because
+    this runs the compiler in the hashing path it is off by default; the extra
+    invocation only happens for the relatively few precompiled-header-creating
+    compilations. The default is false.
+
 [#config_namespace]
 *namespace* (*CCACHE_NAMESPACE*)::
 
