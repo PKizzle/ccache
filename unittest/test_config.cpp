@@ -636,6 +636,7 @@ TEST_CASE("Config::visit_items")
     "max_size = 98.7M\n"
     "msvc_dep_prefix = mdp\n"
     "msvc_utf8 = true\n"
+    "msvc_version_probe = true\n"
     "namespace = ns\n"
     "path = p\n"
     "pch_external_checksum = true\n"
@@ -700,6 +701,7 @@ TEST_CASE("Config::visit_items")
     "(test.conf) max_size = 98.7 MB",
     "(test.conf) msvc_dep_prefix = mdp",
     "(test.conf) msvc_utf8 = true",
+    "(test.conf) msvc_version_probe = true",
     "(test.conf) namespace = ns",
     "(test.conf) path = p",
     "(test.conf) pch_external_checksum = true",
