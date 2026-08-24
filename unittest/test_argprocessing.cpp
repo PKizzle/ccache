@@ -1801,20 +1801,21 @@ TEST_CASE("ISPC target suffixes match Target::ISAToString")
     {"xe2lpg-x32",     "_xe2lpg"    },
   };
 
-  for (const auto& [target, suffix] : cases) {
+  for (const auto& c : cases) {
     TestContext test_context;
     Context ctx;
     ctx.config.set_compiler_type(CompilerType::ispc);
     // A second target is needed since single-target builds produce no extra
     // output files and therefore no suffixes.
     ctx.orig_args = Args::from_string(
-      FMT("ispc -o test.o --target={},generic-i32x8 test.ispc", target));
+      FMT("ispc -o test.o --target={},generic-i32x8 test.ispc", c.target));
     REQUIRE(util::write_file("test.ispc", ""));
     const auto result = process_args(ctx);
 
+    CAPTURE(c.target);
     CHECK(result);
     REQUIRE(ctx.args_info.ispc_target_suffixes.size() == 2);
-    CHECK(ctx.args_info.ispc_target_suffixes[0] == suffix);
+    CHECK(ctx.args_info.ispc_target_suffixes[0] == c.suffix);
   }
 }
 
