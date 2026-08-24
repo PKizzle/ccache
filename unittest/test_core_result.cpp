@@ -16,6 +16,8 @@
 // this program; if not, write to the Free Software Foundation, Inc., 51
 // Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
 
+#include "testutil.hpp"
+
 #include <ccache/config.hpp>
 #include <ccache/context.hpp>
 #include <ccache/core/exceptions.hpp>
@@ -31,6 +33,8 @@
 #include <limits>
 
 namespace fs = std::filesystem;
+
+using TestUtil::TestContext;
 
 using core::ResultRetriever;
 using core::result::Deserializer;
@@ -127,42 +131,55 @@ TEST_CASE("Serializer rejects more than the uint8_t number of file entries")
   CHECK_THROWS_AS(serializer.serialize(bytes), core::Error);
 }
 
-TEST_CASE("ResultRetriever maps ISPC multi-target files by entry order")
+TEST_CASE("ResultRetriever writes ISPC multi-target files in entry order")
 {
+  TestContext test_context;
+  REQUIRE(fs::create_directory("sub"));
+
   Context ctx;
   ctx.args_info.output_obj = "sub/test.o";
   ctx.args_info.ispc_header_file = "sub/test_ispc.h";
   ctx.args_info.ispc_target_suffixes = {"_sse4", "_avx2"};
 
+  const std::array<uint8_t, 1> data = {0x2a};
   ResultRetriever retriever(ctx);
 
-  CHECK(retriever.get_dest_path(FileType::object) == "sub/test.o");
-  CHECK(retriever.get_dest_path(FileType::ispc_header) == "sub/test_ispc.h");
+  // A third entry of each type has no target left to map to and is dropped
+  // rather than written to a wrong name.
+  for (uint8_t i = 0; i < 3; ++i) {
+    retriever.on_embedded_file(i, FileType::ispc_target_object, data);
+  }
+  for (uint8_t i = 0; i < 3; ++i) {
+    retriever.on_embedded_file(i, FileType::ispc_target_header, data);
+  }
 
-  CHECK(retriever.get_dest_path(FileType::ispc_target_object)
-        == fs::path("sub") / "test_sse4.o");
-  CHECK(retriever.get_dest_path(FileType::ispc_target_object)
-        == fs::path("sub") / "test_avx2.o");
-  // No third target: the entry is dropped rather than written to a wrong name.
-  CHECK(retriever.get_dest_path(FileType::ispc_target_object).empty());
+  CHECK(fs::exists("sub/test_sse4.o"));
+  CHECK(fs::exists("sub/test_avx2.o"));
+  CHECK(fs::exists("sub/test_ispc_sse4.h"));
+  CHECK(fs::exists("sub/test_ispc_avx2.h"));
 
-  CHECK(retriever.get_dest_path(FileType::ispc_target_header)
-        == fs::path("sub") / "test_ispc_sse4.h");
-  CHECK(retriever.get_dest_path(FileType::ispc_target_header)
-        == fs::path("sub") / "test_ispc_avx2.h");
-  CHECK(retriever.get_dest_path(FileType::ispc_target_header).empty());
+  size_t written = 0;
+  for ([[maybe_unused]] const auto& entry : fs::directory_iterator("sub")) {
+    ++written;
+  }
+  CHECK(written == 4);
 }
 
 TEST_CASE("ResultRetriever drops ISPC target headers when -h is absent")
 {
+  TestContext test_context;
+
   Context ctx;
   ctx.args_info.output_obj = "test.o";
   ctx.args_info.ispc_target_suffixes = {"_sse4", "_avx2"};
 
+  const std::array<uint8_t, 1> data = {0x2a};
   ResultRetriever retriever(ctx);
 
-  CHECK(retriever.get_dest_path(FileType::ispc_target_object) == "test_sse4.o");
-  CHECK(retriever.get_dest_path(FileType::ispc_target_header).empty());
-}
+  retriever.on_embedded_file(0, FileType::ispc_target_object, data);
+  retriever.on_embedded_file(1, FileType::ispc_target_header, data);
 
+  CHECK(fs::exists("test_sse4.o"));
+  CHECK_FALSE(fs::exists("test_sse4.h"));
+}
 TEST_SUITE_END();

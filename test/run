@@ -758,7 +758,6 @@ COMPILER_ARGS=$(echo $CC | awk '{$1 = ""; print}')
 REAL_COMPILER_BIN=$(find_compiler $COMPILER_BIN)
 REAL_COMPILER="$REAL_COMPILER_BIN$COMPILER_ARGS"
 REAL_NVCC=$(find_compiler nvcc)
-REAL_ISPC=$(find_compiler ispc)
 
 if [ "$REAL_COMPILER_BIN" = "$COMPILER_BIN" ]; then
     echo "Compiler:         $CC"
@@ -771,12 +770,6 @@ if [ -n "$REAL_NVCC" ]; then
     echo "CUDA compiler:    $($REAL_NVCC --version | tail -n 1) ($REAL_NVCC)"
 else
     echo "CUDA compiler:    not available"
-fi
-
-if [ -n "$REAL_ISPC" ]; then
-    echo "ISPC compiler:    $("$REAL_ISPC" --version | head -n 1) ($REAL_ISPC)"
-else
-    echo "ISPC compiler:    not available"
 fi
 echo
 
