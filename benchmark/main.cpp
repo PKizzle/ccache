@@ -1,4 +1,4 @@
-// Copyright (C) 2025-2026 Joel Rosdahl and other contributors
+// Copyright (C) 2026 Joel Rosdahl and other contributors
 //
 // See doc/authors.adoc for a complete list of contributors.
 //
@@ -16,15 +16,6 @@
 // this program; if not, write to the Free Software Foundation, Inc., 51
 // Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
 
-#pragma once
+#include <benchmark/benchmark.h>
 
-#include <string>
-#include <string_view>
-#include <vector>
-
-namespace compiler {
-
-std::vector<std::string>
-split_preprocessed_output_from_clang_cuda(std::string_view output);
-
-} // namespace compiler
+BENCHMARK_MAIN();

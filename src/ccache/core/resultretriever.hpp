@@ -52,13 +52,16 @@ public:
                    result::FileType file_type,
                    uint64_t file_size) override;
 
+  // Destination of the next file of `file_type`. Repeated calls for
+  // ispc_target_object/ispc_target_header advance through the --target list,
+  // whose order is the only thing that distinguishes those entries.
+  std::filesystem::path get_dest_path(result::FileType file_type) const;
+
 private:
   const Context& m_ctx;
   std::optional<Hash::Digest> m_result_key;
   mutable size_t m_ispc_target_object_index = 0;
   mutable size_t m_ispc_target_header_index = 0;
-
-  std::filesystem::path get_dest_path(result::FileType file_type) const;
 
   void write_dependency_file(const std::filesystem::path& path,
                              std::span<const uint8_t> data);

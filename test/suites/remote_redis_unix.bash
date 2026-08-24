@@ -21,6 +21,9 @@ SUITE_remote_redis_unix_PROBE() {
         echo "redis-cli without socket"
         return
     fi
+    if ! probe_unix_server_socket; then
+        echo "creating a local Unix server socket is not permitted"
+    fi
 }
 
 start_redis_unix_server() {
@@ -63,7 +66,7 @@ SUITE_remote_redis_unix() {
 
     socket=$(mktemp "${TMPDIR:-/tmp}/tmp.XXXXXX")
     redis_url="redis+unix:${socket}"
-    export CCACHE_REMOTE_STORAGE="${redis_url}"
+    export CCACHE_REMOTE_STORAGE="${redis_url} helper=_builtin_"
 
     start_redis_unix_server "${socket}"
 
@@ -95,7 +98,7 @@ SUITE_remote_redis_unix() {
     socket=$(mktemp "${TMPDIR:-/tmp}/tmp.XXXXXX")
     password=secret123
     redis_url="redis+unix://${password}@localhost${socket}"
-    export CCACHE_REMOTE_STORAGE="${redis_url}"
+    export CCACHE_REMOTE_STORAGE="${redis_url} helper=_builtin_"
 
     start_redis_unix_server "${socket}" "${password}"
 
@@ -125,7 +128,7 @@ SUITE_remote_redis_unix() {
     # -------------------------------------------------------------------------
     TEST "Unreachable server"
 
-    export CCACHE_REMOTE_STORAGE="redis+unix:///foo"
+    export CCACHE_REMOTE_STORAGE="redis+unix:///foo helper=_builtin_"
 
     $CCACHE_COMPILE -c test.c
     expect_stat direct_cache_hit 0

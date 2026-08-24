@@ -86,8 +86,8 @@ should_store_raw_file(const Config& config, core::result::FileType type)
     return false;
   }
 
-  // Only store object files as raw files since there are several problems with
-  // storing other file types:
+  // Only store object and .dwo files as raw files since there are several
+  // problems with storing other file types:
   //
   // 1. The compiler unlinks object files before writing to them but it doesn't
   //    unlink .d files, so it's possible to corrupt .d files just by running
@@ -103,6 +103,7 @@ should_store_raw_file(const Config& config, core::result::FileType type)
   // them, so we keep things simple for now. This will also save i-nodes in the
   // cache.
   return type == core::result::FileType::object
+         || type == core::result::FileType::dwarf_object
          || type == core::result::FileType::ispc_target_object;
 }
 
@@ -160,6 +161,9 @@ file_type_to_string(FileType type)
   case FileType::source_dependencies:
     return ".sourcedeps.json";
 
+  case FileType::sarif:
+    return ".sarif";
+
   case FileType::ispc_header:
     return ".ispc.h";
 
@@ -215,7 +219,6 @@ Deserializer::visit(Deserializer::Visitor& visitor) const
                     header.format_version,
                     k_format_version));
   }
-
   header.n_files = reader.read_int<uint8_t>();
   visitor.on_header(header);
 

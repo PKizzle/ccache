@@ -38,13 +38,13 @@ endif()
 
 if(_download_hiredis)
   set(_hiredis_origin DOWNLOADED)
-  set(_hiredis_version_string 1.3.0)
+  set(_hiredis_version_string 1.4.1)
 
   include(FetchContent)
   FetchContent_Declare(
     Hiredis
     URL "https://github.com/redis/hiredis/archive/refs/tags/v${_hiredis_version_string}.tar.gz"
-    URL_HASH SHA256=25cee4500f359cf5cad3b51ed62059aadfc0939b05150c1f19c7e2829123631c
+    URL_HASH SHA256=ca3180359a8b1275838a45415851f8cd5c411e27bdbf18f4823012e45507d2e4
     # Intentionally not using hiredis's build system since it doesn't put
     # headers in a hiredis subdirectory. Reference:
     # https://discourse.cmake.org/t/prevent-fetchcontent-makeavailable-to-execute-cmakelists-txt/12704/3

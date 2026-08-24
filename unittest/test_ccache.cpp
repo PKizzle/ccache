@@ -199,6 +199,9 @@ TEST_CASE("guess_compiler")
 
     CHECK(guess_compiler("/test/prefix/ispc") == CompilerType::ispc);
 
+    CHECK(guess_compiler("/test/prefix/qcc") == CompilerType::qcc);
+    CHECK(guess_compiler("/test/prefix/q++") == CompilerType::qcc);
+
     CHECK(guess_compiler("/test/prefix/x") == CompilerType::other);
     CHECK(guess_compiler("/test/prefix/cc") == CompilerType::other);
     CHECK(guess_compiler("/test/prefix/c++") == CompilerType::other);
@@ -296,6 +299,11 @@ TEST_CASE("file_path_matches_dir_prefix_or_file")
 #ifdef _WIN32
   CHECK(file_path_matches_dir_prefix_or_file("\\aa", "\\aa\\bb"));
   CHECK(file_path_matches_dir_prefix_or_file("\\aa\\", "\\aa\\bb"));
+  CHECK(file_path_matches_dir_prefix_or_file(
+    fs::path(L"C:\\\u00c5ngstr\u00f6m"),
+    fs::path(L"c:\\\u00e5NGSTR\u00d6M\\header.h")));
+  CHECK(file_path_matches_dir_prefix_or_file("\\aa", "/aa/bb"));
+  CHECK(file_path_matches_dir_prefix_or_file("/aa", "\\aa\\bb"));
 #else
   CHECK(!file_path_matches_dir_prefix_or_file("\\aa", "\\aa\\bb"));
   CHECK(!file_path_matches_dir_prefix_or_file("\\aa\\", "\\aa\\bb"));
@@ -304,35 +312,67 @@ TEST_CASE("file_path_matches_dir_prefix_or_file")
 
 TEST_CASE("should_ignore_missing_include")
 {
-  SUBCASE("ISPC ignores missing includes")
+  // ISPC embeds core.isph/stdlib.isph in the compiler binary and reports them
+  // with virtual paths. The binary itself is covered by compiler_check, and a
+  // genuinely missing user #include makes ISPC fail before ccache sees the
+  // preprocessor output.
+  CHECK(should_ignore_missing_include(CompilerType::ispc));
+
+  CHECK_FALSE(should_ignore_missing_include(CompilerType::gcc));
+  CHECK_FALSE(should_ignore_missing_include(CompilerType::clang));
+  CHECK_FALSE(should_ignore_missing_include(CompilerType::clang_cl));
+  CHECK_FALSE(should_ignore_missing_include(CompilerType::msvc));
+  CHECK_FALSE(should_ignore_missing_include(CompilerType::nvcc));
+  CHECK_FALSE(should_ignore_missing_include(CompilerType::qcc));
+  CHECK_FALSE(should_ignore_missing_include(CompilerType::other));
+}
+
+TEST_CASE("get_preprocessor_args_for_cache_lookup")
+{
+  TestContext test_context;
+  Context ctx;
+  ctx.config.set_compiler_type(CompilerType::ispc);
+
+  SUBCASE("multi-target --target=a,b is reduced to the first target")
   {
-    // ISPC embeds built-in headers in its compiler binary.
-    // These appear in preprocessor output with virtual paths
-    // that don't exist on disk. This is safe to ignore because:
-    //
-    // 1. The built-in headers are part of the compiler binary, which is
-    //    already captured by the compiler_check hash.
-    // 2. A truly missing user #include would cause ISPC to exit with an
-    //    error before ccache ever sees the preprocessor output, so any
-    //    non-existent path that reaches remember_include_file is guaranteed
-    //    to be a compiler-embedded built-in.
-    CHECK(should_ignore_missing_include(CompilerType::ispc));
+    ctx.args_info.ispc_target_suffixes = {"_avx2", "_sse4"};
+    ctx.args_info.ispc_first_target = "avx2-i32x8";
+    const Args args =
+      Args::from_string("ispc --target=avx2-i32x8,sse4.2-i32x4 -O2");
+
+    CHECK(get_preprocessor_args_for_cache_lookup(ctx, args).to_string()
+          == "ispc --target=avx2-i32x8 -O2");
   }
 
-  SUBCASE("Other compilers do not ignore missing includes")
+  SUBCASE("multi-target --target a,b is reduced to the first target")
   {
-    // GCC and Clang use angle-bracket paths (<built-in>, <command-line>) for
-    // their virtual headers, which are already filtered out earlier in
-    // remember_include_file. Their real built-in headers are actual files
-    // on disk inside the compiler installation directory.
-    // So if a path doesn't exist for these compilers, it signals a real
-    // problem and direct mode should be disabled.
-    CHECK_FALSE(should_ignore_missing_include(CompilerType::gcc));
-    CHECK_FALSE(should_ignore_missing_include(CompilerType::clang));
-    CHECK_FALSE(should_ignore_missing_include(CompilerType::msvc));
-    CHECK_FALSE(should_ignore_missing_include(CompilerType::nvcc));
-    CHECK_FALSE(should_ignore_missing_include(CompilerType::clang_cl));
-    CHECK_FALSE(should_ignore_missing_include(CompilerType::other));
+    ctx.args_info.ispc_target_suffixes = {"_avx2", "_sse4"};
+    ctx.args_info.ispc_first_target = "avx2-i32x8";
+    const Args args =
+      Args::from_string("ispc --target avx2-i32x8,sse4.2-i32x4 -O2");
+
+    CHECK(get_preprocessor_args_for_cache_lookup(ctx, args).to_string()
+          == "ispc --target avx2-i32x8 -O2");
+  }
+
+  SUBCASE("single-target arguments are passed through unchanged")
+  {
+    ctx.args_info.ispc_first_target = "avx2-i32x8";
+    const Args args = Args::from_string("ispc --target=avx2-i32x8 -O2");
+
+    CHECK(get_preprocessor_args_for_cache_lookup(ctx, args).to_string()
+          == args.to_string());
+  }
+
+  SUBCASE("non-ISPC arguments are passed through unchanged")
+  {
+    ctx.config.set_compiler_type(CompilerType::clang);
+    ctx.args_info.ispc_target_suffixes = {"_avx2", "_sse4"};
+    ctx.args_info.ispc_first_target = "avx2-i32x8";
+    const Args args = Args::from_string("clang --target=x86_64-linux-gnu -O2");
+
+    CHECK(get_preprocessor_args_for_cache_lookup(ctx, args).to_string()
+          == args.to_string());
   }
 }
 
