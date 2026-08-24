@@ -26,9 +26,12 @@
 #include <ccache/util/direntry.hpp>
 #include <ccache/util/environment.hpp>
 #include <ccache/util/error.hpp>
+#include <ccache/util/file.hpp>
+#include <ccache/util/filelock.hpp>
+#include <ccache/util/filestream.hpp>
 #include <ccache/util/format.hpp>
-#include <ccache/util/lockfile.hpp>
 #include <ccache/util/logging.hpp>
+#include <ccache/util/path.hpp>
 #include <ccache/util/process.hpp>
 #include <ccache/util/string.hpp>
 #include <ccache/util/timer.hpp>
@@ -76,8 +79,7 @@ constexpr std::string_view k_named_pipe_prefix = "\\\\.\\pipe\\";
 std::string
 generate_endpoint_name(
   const Url& url,
-  const std::vector<RemoteStorage::Backend::Attribute>& attributes,
-  uint8_t max_greeting_format)
+  const std::vector<RemoteStorage::Backend::Attribute>& attributes)
 {
   static const uint8_t delimiter[1] = {0};
 
@@ -99,8 +101,6 @@ generate_endpoint_name(
     hash.hash(delimiter);
     hash.hash(attr.value);
   }
-  hash.hash(delimiter);
-  hash.hash(static_cast<int64_t>(max_greeting_format));
   return FMT("storage-{}-{}", url.scheme(), util::format_base16(hash.digest()));
 }
 
@@ -167,8 +167,6 @@ build_helper_env(
   env_vars.emplace_back(FMT("CRSH_URL={}", url.str()));
   env_vars.emplace_back(
     FMT("CRSH_IDLE_TIMEOUT={}", idle_timeout.count() / 1000));
-  env_vars.emplace_back(
-    FMT("CRSH_FORMAT_MAX={}", Client::k_max_greeting_format));
   env_vars.emplace_back(FMT("CRSH_NUM_ATTR={}", attributes.size()));
 
   for (size_t i = 0; i < attributes.size(); ++i) {
@@ -188,8 +186,8 @@ is_ccache_crsh_var(std::string_view entry)
   }
 
   return name == "CRSH_IPC_ENDPOINT" || name == "CRSH_URL"
-         || name == "CRSH_IDLE_TIMEOUT" || name == "CRSH_FORMAT_MAX"
-         || name == "CRSH_NUM_ATTR" || name.starts_with("CRSH_ATTR_KEY_")
+         || name == "CRSH_IDLE_TIMEOUT" || name == "CRSH_NUM_ATTR"
+         || name.starts_with("CRSH_ATTR_KEY_")
          || name.starts_with("CRSH_ATTR_VALUE_");
 }
 
@@ -428,8 +426,7 @@ HelperBackend::HelperBackend(const fs::path& helper_path,
     // No m_endpoint_lock_path needed since we won't spawn a helper.
   } else {
     // The common case:
-    auto endpoint_name =
-      generate_endpoint_name(url, attributes, Client::k_max_greeting_format);
+    auto endpoint_name = generate_endpoint_name(url, attributes);
 #ifdef _WIN32
     m_endpoint = FMT("{}ccache-{}", k_named_pipe_prefix, endpoint_name);
     m_endpoint_lock_path = FMT("{}/{}", temp_dir, endpoint_name);
@@ -450,19 +447,26 @@ HelperBackend::finalize_connection()
 {
   if (util::logging::enabled()) {
     auto capabilities = util::join(m_client.capabilities(), " ");
-    LOG("Storage helper: {} (format: {}, capabilities: {})",
-        !m_client.server_identity().empty() ? m_client.server_identity()
-                                            : "[unknown]",
-        m_client.greeting_format(),
-        capabilities);
-    for (const auto& msg : m_client.diagnostics()) {
+    std::string server_identity = "[unknown]";
+    std::vector<std::string> diagnostics;
+    if (m_client.has_capability(Client::Capability::info)) {
+      auto info_result = m_client.info();
+      if (!info_result) {
+        LOG("Failed to get helper info: {}", info_result.error().message);
+        return tl::unexpected(Failure::error);
+      }
+      server_identity = std::move(info_result->server_identity);
+      diagnostics = std::move(info_result->diagnostics);
+    }
+    LOG("Storage helper: {} (capabilities: {})", server_identity, capabilities);
+    for (const auto& msg : diagnostics) {
       LOG("Storage helper diagnostic: {}", msg);
     }
   }
 
-  if (!m_client.has_capability(Client::Capability::get_put_remove_stop)) {
+  if (!m_client.has_capability(Client::Capability::get_put_remove)) {
     LOG("Storage helper does not support capability {}",
-        static_cast<int>(Client::Capability::get_put_remove_stop));
+        static_cast<int>(Client::Capability::get_put_remove));
     return tl::unexpected(Failure::error);
   }
 
@@ -492,6 +496,11 @@ HelperBackend::ensure_connected(bool spawn)
     connect_result.error().message,
     timer.measure_ms());
 
+  if (connect_result.error().failure == Client::Failure::permission_denied) {
+    LOG("Not spawning remote storage helper since IPC access was denied");
+    return tl::unexpected(Failure::error);
+  }
+
   if (!spawn) {
     return {};
   }
@@ -502,21 +511,45 @@ HelperBackend::ensure_connected(bool spawn)
   }
 
   // No existing helper, spawn a new one. Use a lock file to prevent multiple
-  // processes from spawning simultaneously.
-  util::LockFile spawn_lock(m_endpoint_lock_path);
-  if (!spawn_lock.acquire()) {
-    LOG("Failed to acquire spawn lock");
+  // processes from spawning simultaneously. The lock file is intentionally
+  // never removed since removing it would let another process lock a new file
+  // with the same path.
+  const fs::path lock_path = util::pstr(m_endpoint_lock_path).str() + ".lock";
+  util::FileStream lock_file(lock_path, "ab");
+  if (!lock_file) {
+    // The directory may not exist yet.
+    if (auto r = fs::create_directories(lock_path.parent_path()); !r) {
+      LOG("Failed to create {}: {}", lock_path.parent_path(), r.error());
+    }
+    lock_file.open(lock_path, "ab");
+  }
+  if (!lock_file) {
+    LOG("Failed to open spawn lock file {}: {}", lock_path, strerror(errno));
     return tl::unexpected(Failure::error);
   }
+  util::set_cloexec_flag(fileno(*lock_file));
+
+  LOG("Acquiring spawn lock {}", lock_path);
+  util::FileLock spawn_lock(fileno(*lock_file));
+  if (!spawn_lock.acquire()) {
+    LOG("Failed to acquire spawn lock {}", lock_path);
+    return tl::unexpected(Failure::error);
+  }
+  LOG("Acquired spawn lock {}", lock_path);
 
   // We have the lock. Check again if another process spawned while we waited.
   timer.reset();
-  if (m_client.connect(m_endpoint)) {
+  connect_result = m_client.connect(m_endpoint);
+  if (connect_result) {
     LOG(
       "Connected to remote storage helper spawned by another process ({:.2f}"
       " ms)",
       timer.measure_ms());
     return finalize_connection();
+  }
+  if (connect_result.error().failure == Client::Failure::permission_denied) {
+    LOG("Not spawning remote storage helper since IPC access was denied");
+    return tl::unexpected(Failure::error);
   }
 
   // No helper exists, spawn it now.
@@ -542,6 +575,13 @@ HelperBackend::ensure_connected(bool spawn)
           m_endpoint,
           timer.measure_ms());
       return finalize_connection();
+    }
+
+    if (connect_result.error().failure == Client::Failure::permission_denied) {
+      LOG(
+        "Giving up connecting to spawned remote storage helper since IPC"
+        " access was denied");
+      return tl::unexpected(Failure::error);
     }
 
     std::this_thread::sleep_for(sleep_duration);
@@ -578,8 +618,30 @@ HelperBackend::put(const Hash::Digest& key,
 {
   TRY(ensure_connected());
 
-  Client::PutFlags flags;
-  flags.overwrite = (overwrite == Overwrite::yes);
+  Client::PutFlags flags{.overwrite = true};
+
+  if (overwrite == Overwrite::no) {
+    if (m_client.has_capability(Client::Capability::exists)) {
+      // Prefer asking with exists instead of setting overwrite=false to avoid
+      // having to send the payload to the helper in case the key already
+      // exists.
+      auto result = m_client.exists(key);
+      if (!result) {
+        const auto& error = result.error();
+        LOG("Remote storage exists failed: {}", error.message);
+        auto failure = (error.failure == Client::Failure::timeout)
+                         ? Failure::timeout
+                         : Failure::error;
+        return tl::unexpected(failure);
+      }
+      bool exists = *result;
+      if (exists) {
+        return false;
+      }
+    } else {
+      flags.overwrite = false;
+    }
+  }
 
   auto result = m_client.put(key, value, flags);
   if (!result) {

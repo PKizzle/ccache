@@ -34,11 +34,12 @@
 #endif
 
 using namespace std::chrono_literals;
+using storage::remote::Client;
 
 namespace {
 
-const auto k_data_timeout = 1000ms;    // default for data-timeout property
-const auto k_request_timeout = 5000ms; // default for request-timeout property
+const auto k_data_timeout = 10s;     // default for data-timeout property
+const auto k_request_timeout = 1min; // default for request-timeout property
 
 constexpr const char USAGE_TEXT[] =
   R"(Usage: {0} IPC_ENDPOINT COMMAND [args...]
@@ -47,13 +48,16 @@ This is a CLI tool for testing ccache storage helper implementations.
 
 Commands:
     ping                            check if helper is reachable
+    info                            print helper info
+    stop                            tell the helper to stop
+
+    exists KEY                      check if a value exists in storage
     get KEY -o FILE                 get a value and output to file
     get KEY -o -                    get a value and output to stdout
-    put [--overwrite] KEY -i FILE   put a value from file
-    put [--overwrite] KEY -i -      put a value from stdin
-    put [--overwrite] KEY -v VALUE  put a literal value
+    put [-n] KEY -i FILE            put a value from file (-n = no overwrite)
+    put [-n] KEY -i -               put a value from stdin (-n = no overwrite)
+    put [-n] KEY -v VALUE           put a literal value (-n = no overwrite)
     remove KEY                      remove a value from storage
-    stop                            tell the helper to stop
 
 Notes:
     KEY must be a hexadecimal string (0-9, a-f, A-F).
@@ -66,13 +70,11 @@ print_usage(FILE* stream, const char* program_name)
   PRINT(stream, USAGE_TEXT, program_name);
 }
 
-int
-cmd_get(storage::remote::Client& client, const std::vector<std::string>& args)
+tl::expected<int, std::string>
+cmd_exists(Client& client, const std::vector<std::string>& args)
 {
-  if (args.size() != 3 || args[1] != "-o") {
-    PRINT(stderr, "Error: get requires: KEY -o OUTPUT\n");
-    PRINT(stderr, "  where OUTPUT is a file path or - for stdout\n");
-    return 1;
+  if (args.size() != 1) {
+    return tl::unexpected("exists requires exactly 1 argument: KEY");
   }
 
   auto key_result = util::parse_base16(args[0]);
@@ -81,17 +83,45 @@ cmd_get(storage::remote::Client& client, const std::vector<std::string>& args)
     return 1;
   }
   const auto& key = *key_result;
-  const auto& output = args[2];
 
-  auto result = client.get(key);
+  auto result = client.exists(key);
 
   if (!result) {
     PRINT(stderr, "Error: {}\n", result.error().message);
     return 1;
   }
 
+  if (*result) {
+    PRINT(stdout, "yes\n");
+    return 0;
+  } else {
+    PRINT(stderr, "no\n");
+    return 2;
+  }
+}
+
+tl::expected<int, std::string>
+cmd_get(Client& client, const std::vector<std::string>& args)
+{
+  if (args.size() != 3 || args[1] != "-o") {
+    return tl::unexpected("missing arguments");
+  }
+
+  auto key_result = util::parse_base16(args[0]);
+  if (!key_result) {
+    return tl::unexpected(FMT("invalid hex key: {}", key_result.error()));
+  }
+  const auto& key = *key_result;
+  const auto& output = args[2];
+
+  auto result = client.get(key);
+
+  if (!result) {
+    return tl::unexpected(result.error().message);
+  }
+
   if (!*result) {
-    PRINT(stderr, "Key not found: {}\n", util::format_base16(key));
+    PRINT(stdout, "Key not found: {}", util::format_base16(key));
     return 2;
   }
 
@@ -101,37 +131,49 @@ cmd_get(storage::remote::Client& client, const std::vector<std::string>& args)
     std::fwrite(value.data(), 1, value.size(), stdout);
   } else {
     if (auto r = util::write_file(output, value); !r) {
-      PRINT(stderr, "Error writing to {}: {}", output, r.error());
-      return 1;
+      return tl::unexpected(FMT("failed writing to {}: {}", output, r.error()));
     }
   }
 
   return 0;
 }
 
-int
-cmd_put(storage::remote::Client& client, const std::vector<std::string>& args)
+tl::expected<int, std::string>
+cmd_info(Client& client, const std::vector<std::string>& args)
 {
-  storage::remote::Client::PutFlags flags;
+  if (args.size() != 0) {
+    return tl::unexpected("info does not take any argument");
+  }
+
+  auto result = client.info();
+
+  if (!result) {
+    return tl::unexpected(result.error().message);
+  }
+
+  PRINT(stdout, "Server identity: {}\n", result->server_identity);
+  PRINT(stdout, "Capabilities: {}\n", util::join(client.capabilities(), " "));
+  return 0;
+}
+
+tl::expected<int, std::string>
+cmd_put(Client& client, const std::vector<std::string>& args)
+{
+  Client::PutFlags flags{.overwrite = true};
   size_t start_idx = 0;
 
-  if (!args.empty() && args[0] == "--overwrite") {
-    flags.overwrite = true;
+  if (!args.empty() && args[0] == "-n") {
+    flags.overwrite = false;
     start_idx = 1;
   }
 
   if (args.size() - start_idx != 3) {
-    PRINT(stderr,
-          "Error: put requires: [--overwrite] KEY -i INPUT\n"
-          "                 or: [--overwrite] KEY -v VALUE\n"
-          "  where INPUT is a file path or - for stdin\n");
-    return 1;
+    return tl::unexpected("missing arguments");
   }
 
   auto key_result = util::parse_base16(args[start_idx]);
   if (!key_result) {
-    PRINT(stderr, "Error: Invalid hex key: {}\n", key_result.error());
-    return 1;
+    return tl::unexpected(FMT("invalid hex key: {}", key_result.error()));
   }
   const auto& key = *key_result;
   const auto& mode = args[start_idx + 1];
@@ -145,28 +187,25 @@ cmd_put(storage::remote::Client& client, const std::vector<std::string>& args)
     if (input == "-") {
       auto r = util::read_fd(STDIN_FILENO);
       if (!r) {
-        PRINT(stderr, "Error reading from stdin: {}", r.error());
-        return 1;
+        return tl::unexpected(FMT("failed reading from stdin: {}", r.error()));
       }
       value = std::move(*r);
     } else {
       auto r = util::read_file<util::Bytes>(input);
       if (!r) {
-        PRINT(stderr, "Error reading from {}: {}", input, r.error());
-        return 1;
+        return tl::unexpected(
+          FMT("failed reading from {}: {}", input, r.error()));
       }
       value = std::move(*r);
     }
   } else {
-    PRINT(stderr, "Error: Unknown mode \"{}\". Use -v or -i\n", mode);
-    return 1;
+    return tl::unexpected(FMT("unknown mode flag: {}", mode));
   }
 
   auto result = client.put(key, value, flags);
 
   if (!result) {
-    PRINT(stderr, "Error: {}\n", result.error().message);
-    return 1;
+    return tl::unexpected(result.error().message);
   }
 
   if (*result) {
@@ -178,27 +217,23 @@ cmd_put(storage::remote::Client& client, const std::vector<std::string>& args)
   }
 }
 
-int
-cmd_remove(storage::remote::Client& client,
-           const std::vector<std::string>& args)
+tl::expected<int, std::string>
+cmd_remove(Client& client, const std::vector<std::string>& args)
 {
   if (args.size() != 1) {
-    PRINT(stderr, "Error: remove requires exactly 1 argument: KEY\n");
-    return 1;
+    return tl::unexpected("remove requires exactly 1 argument: KEY");
   }
 
   auto key_result = util::parse_base16(args[0]);
   if (!key_result) {
-    PRINT(stderr, "Error: Invalid hex key: {}\n", key_result.error());
-    return 1;
+    return tl::unexpected(FMT("invalid hex key: {}", key_result.error()));
   }
   const auto& key = *key_result;
 
   auto result = client.remove(key);
 
   if (!result) {
-    PRINT(stderr, "Error: {}\n", result.error().message);
-    return 1;
+    return tl::unexpected(result.error().message);
   }
 
   if (*result) {
@@ -210,31 +245,28 @@ cmd_remove(storage::remote::Client& client,
   }
 }
 
-int
-cmd_stop(storage::remote::Client& client, const std::vector<std::string>& args)
+tl::expected<int, std::string>
+cmd_stop(Client& client, const std::vector<std::string>& args)
 {
   if (!args.empty()) {
-    PRINT(stderr, "Error: stop takes no arguments\n");
-    return 1;
+    return tl::unexpected("stop takes no arguments");
   }
 
   auto result = client.stop();
 
   if (!result) {
-    PRINT(stderr, "Error: {}\n", result.error().message);
-    return 1;
+    return tl::unexpected(result.error().message);
   }
 
   PRINT(stdout, "Helper stopped\n");
   return 0;
 }
 
-int
-cmd_ping(storage::remote::Client& client, const std::vector<std::string>& args)
+tl::expected<int, std::string>
+cmd_ping(const std::vector<std::string>& args)
 {
   if (!args.empty()) {
-    PRINT(stderr, "Error: ping takes no arguments\n");
-    return 1;
+    return tl::unexpected("ping takes no arguments");
   }
 
   // Connection and protocol verification already done in main.
@@ -243,6 +275,50 @@ cmd_ping(storage::remote::Client& client, const std::vector<std::string>& args)
 }
 
 } // namespace
+
+tl::expected<void, std::string>
+require_capability(const Client& client, Client::Capability capability)
+{
+  if (!client.has_capability(capability)) {
+    return tl::unexpected(
+      FMT("storage helper does not support capability \"{}\"",
+          to_string(capability)));
+  }
+  return {};
+}
+
+tl::expected<int, std::string>
+handle_command(Client& client,
+               const std::string& command,
+               const std::vector<std::string>& args)
+{
+  int result = 0;
+
+  if (command == "ping") {
+    TRY_ASSIGN(result, cmd_ping(args));
+  } else if (command == "exists") {
+    TRY(require_capability(client, Client::Capability::exists));
+    TRY_ASSIGN(result, cmd_exists(client, args));
+  } else if (command == "get") {
+    TRY(require_capability(client, Client::Capability::get_put_remove));
+    TRY_ASSIGN(result, cmd_get(client, args));
+  } else if (command == "info") {
+    TRY(require_capability(client, Client::Capability::info));
+    TRY_ASSIGN(result, cmd_info(client, args));
+  } else if (command == "put") {
+    TRY(require_capability(client, Client::Capability::get_put_remove));
+    TRY_ASSIGN(result, cmd_put(client, args));
+  } else if (command == "remove") {
+    TRY(require_capability(client, Client::Capability::get_put_remove));
+    TRY_ASSIGN(result, cmd_remove(client, args));
+  } else if (command == "stop") {
+    TRY_ASSIGN(result, cmd_stop(client, args));
+  } else {
+    return tl::unexpected(FMT("Unknown command: {}", command));
+  }
+
+  return result;
+}
 
 int
 main(int argc, char* argv[])
@@ -264,43 +340,31 @@ main(int argc, char* argv[])
 #else
     argv[1];
 #endif
-  const std::string command = argv[2];
 
-  std::vector<std::string> cmd_args;
-  for (int i = 3; i < argc; ++i) {
-    cmd_args.push_back(argv[i]);
-  }
-
-  storage::remote::Client client(k_data_timeout, k_request_timeout);
+  Client client(k_data_timeout, k_request_timeout);
   auto connect_result = client.connect(ipc_endpoint);
 
   if (!connect_result) {
     PRINT(stderr,
-          "Failed to connect to {}: {}\n",
+          "Failed connecting to {}: {}\n",
           ipc_endpoint,
           connect_result.error().message);
     return 1;
   }
 
-  if (!client.has_capability(
-        storage::remote::Client::Capability::get_put_remove_stop)) {
-    PRINT(stderr, "Helper does not support get/put/remove/stop operations\n");
+  const std::string command = argv[2];
+  std::vector<std::string> args;
+  for (int i = 3; i < argc; ++i) {
+    args.push_back(argv[i]);
+  }
+
+  auto result = handle_command(client, command, args);
+  if (result) {
+    return *result;
+  } else {
+    PRINT(stderr, "Error: {}\n", result.error());
     return 1;
   }
 
-  if (command == "ping") {
-    return cmd_ping(client, cmd_args);
-  } else if (command == "get") {
-    return cmd_get(client, cmd_args);
-  } else if (command == "put") {
-    return cmd_put(client, cmd_args);
-  } else if (command == "remove") {
-    return cmd_remove(client, cmd_args);
-  } else if (command == "stop") {
-    return cmd_stop(client, cmd_args);
-  } else {
-    PRINT(stderr, "Unknown command: {}\n\n", command);
-    print_usage(stderr, argv[0]);
-    return 1;
-  }
+  return 0;
 }

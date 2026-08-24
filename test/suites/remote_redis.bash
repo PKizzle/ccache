@@ -14,6 +14,9 @@ SUITE_remote_redis_PROBE() {
         echo "neither redis-cli nor valkey-cli found"
         return
     fi
+    if ! probe_tcp_server_socket; then
+        echo "creating a local TCP server socket is not permitted"
+    fi
 }
 
 start_redis_server() {
@@ -56,7 +59,7 @@ SUITE_remote_redis() {
 
     port=7777
     redis_url="redis://localhost:${port}"
-    export CCACHE_REMOTE_STORAGE="${redis_url}"
+    export CCACHE_REMOTE_STORAGE="${redis_url} helper=_builtin_"
 
     start_redis_server "${port}"
 
@@ -88,7 +91,7 @@ SUITE_remote_redis() {
     port=7777
     password=secret123
     redis_url="redis://${password}@localhost:${port}"
-    export CCACHE_REMOTE_STORAGE="${redis_url}"
+    export CCACHE_REMOTE_STORAGE="${redis_url} helper=_builtin_"
 
     start_redis_server "${port}" "${password}"
 
@@ -118,7 +121,7 @@ SUITE_remote_redis() {
     # -------------------------------------------------------------------------
     TEST "Unreachable server"
 
-    export CCACHE_REMOTE_STORAGE="redis://localhost:1"
+    export CCACHE_REMOTE_STORAGE="redis://localhost:1 helper=_builtin_"
 
     $CCACHE_COMPILE -c test.c
     expect_stat direct_cache_hit 0

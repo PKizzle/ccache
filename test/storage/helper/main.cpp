@@ -56,7 +56,10 @@
 
 namespace fs = util::filesystem;
 
-constexpr uint8_t CAP_GET_PUT_REMOVE_STOP = 0x00;
+constexpr uint8_t PROTOCOL_VERSION = 0x01;
+constexpr uint8_t CAP_GET_PUT_REMOVE = 0x00;
+constexpr uint8_t CAP_INFO = 0x01;
+constexpr uint8_t CAP_EXISTS = 0x02;
 
 constexpr uint8_t STATUS_OK = 0x00;
 constexpr uint8_t STATUS_NOOP = 0x01;
@@ -66,8 +69,18 @@ constexpr uint8_t REQ_GET = 0x00;
 constexpr uint8_t REQ_PUT = 0x01;
 constexpr uint8_t REQ_REMOVE = 0x02;
 constexpr uint8_t REQ_STOP = 0x03;
+constexpr uint8_t REQ_INFO = 0x04;
+constexpr uint8_t REQ_EXISTS = 0x05;
 
 constexpr uint8_t PUT_FLAG_OVERWRITE = 0x01;
+
+constexpr uint8_t GREETING[] = {
+  PROTOCOL_VERSION,
+  3,
+  CAP_GET_PUT_REMOVE,
+  CAP_INFO,
+  CAP_EXISTS,
+};
 
 #ifdef _WIN32
 using ConnHandle = HANDLE;
@@ -104,13 +117,10 @@ fail(const std::string& message)
 class IpcServer
 {
 public:
-  IpcServer(const std::string& endpoint,
-            std::chrono::seconds idle_timeout,
-            uint8_t greeting_format)
+  IpcServer(const std::string& endpoint, std::chrono::seconds idle_timeout)
     : m_endpoint(endpoint),
       m_idle_timeout(idle_timeout),
-      m_last_activity(util::now()),
-      m_greeting_format(greeting_format)
+      m_last_activity(util::now())
   {
   }
 
@@ -120,13 +130,14 @@ private:
   std::string m_endpoint;
   std::chrono::seconds m_idle_timeout;
   util::TimePoint m_last_activity;
-  uint8_t m_greeting_format;
   std::unordered_map<std::string, std::vector<uint8_t>> m_storage;
 
   bool recv_exact(ConnHandle conn, uint8_t* buf, size_t count);
   void send_data(ConnHandle conn, const uint8_t* data, size_t len);
   void send_error(ConnHandle conn, const char* message);
+  void handle_exists(ConnHandle conn);
   void handle_get(ConnHandle conn);
+  void handle_info(ConnHandle conn);
   void handle_put(ConnHandle conn);
   void handle_remove(ConnHandle conn);
   void handle_stop(ConnHandle conn);
@@ -221,6 +232,36 @@ IpcServer::send_error(ConnHandle conn, const char* message)
 }
 
 void
+IpcServer::handle_exists(ConnHandle conn)
+{
+  uint8_t key_len;
+  if (!recv_exact(conn, &key_len, 1)) {
+    return;
+  }
+
+  std::string key;
+  if (key_len > 0) {
+    key.resize(key_len);
+    if (!recv_exact(conn, reinterpret_cast<uint8_t*>(key.data()), key_len)) {
+      return;
+    }
+  }
+
+  log_msg(FMT("EXISTS: key_len={}", key_len));
+
+  auto it = m_storage.find(key);
+  if (it != m_storage.end()) {
+    static uint8_t response[] = {STATUS_OK, 0x01};
+    send_data(conn, response, sizeof(response));
+    log_msg("  -> exists");
+  } else {
+    static uint8_t response[] = {STATUS_OK, 0x00};
+    send_data(conn, response, sizeof(response));
+    log_msg("  -> does not exist");
+  }
+}
+
+void
 IpcServer::handle_get(ConnHandle conn)
 {
   uint8_t key_len;
@@ -257,6 +298,19 @@ IpcServer::handle_get(ConnHandle conn)
     send_data(conn, &response, 1);
     log_msg("  -> not found");
   }
+}
+
+void
+IpcServer::handle_info(ConnHandle conn)
+{
+  log_msg("INFO");
+  const std::string_view identity = "ccache-storage-test";
+  std::vector<uint8_t> response;
+  response.push_back(static_cast<uint8_t>(identity.size()));
+  auto id_data = reinterpret_cast<const uint8_t*>(identity.data());
+  response.insert(response.end(), id_data, id_data + identity.size());
+  response.push_back(0); // 0 diagnostics
+  send_data(conn, response.data(), response.size());
 }
 
 void
@@ -358,21 +412,7 @@ IpcServer::handle_stop(ConnHandle conn)
 void
 IpcServer::handle_client(ConnHandle conn)
 {
-  if (m_greeting_format == 2) {
-    const std::string_view identity = "ccache-storage-test";
-    std::vector<uint8_t> greeting;
-    greeting.push_back(0x02); // greeting_2
-    greeting.push_back(1);    // 1 capability
-    greeting.push_back(CAP_GET_PUT_REMOVE_STOP);
-    greeting.push_back(static_cast<uint8_t>(identity.size()));
-    auto id_data = reinterpret_cast<const uint8_t*>(identity.data());
-    greeting.insert(greeting.end(), id_data, id_data + identity.size());
-    greeting.push_back(0); // 0 diagnostics
-    send_data(conn, greeting.data(), greeting.size());
-  } else {
-    const uint8_t greeting[] = {0x01, 1, CAP_GET_PUT_REMOVE_STOP};
-    send_data(conn, greeting, sizeof(greeting));
-  }
+  send_data(conn, GREETING, sizeof(GREETING));
 
   while (true) {
     uint8_t request_type;
@@ -383,8 +423,16 @@ IpcServer::handle_client(ConnHandle conn)
     update_activity();
 
     switch (request_type) {
+    case REQ_EXISTS:
+      handle_exists(conn);
+      break;
+
     case REQ_GET:
       handle_get(conn);
+      break;
+
+    case REQ_INFO:
+      handle_info(conn);
       break;
 
     case REQ_PUT:
@@ -585,25 +633,12 @@ main()
     idle_timeout = *value;
   }
 
-  uint8_t greeting_format = 1;
-  const char* format_max_env = std::getenv("CRSH_FORMAT_MAX");
-  if (format_max_env) {
-    auto client_format_max = util::parse_unsigned(format_max_env, 1, UINT8_MAX);
-    if (!client_format_max) {
-      fail(FMT("Invalid CRSH_FORMAT_MAX: {}", client_format_max.error()));
-    }
-    constexpr uint8_t server_format_max = 2;
-    greeting_format = std::min<uint8_t>(*client_format_max, server_format_max);
-  }
-
   log_msg("Starting");
   log_msg(FMT("IPC endpoint: {}", endpoint));
   log_msg(FMT("URL: {}", url));
   log_msg(FMT("Idle timeout: {}", idle_timeout));
-  log_msg(FMT("Greeting format: {}", greeting_format));
 
-  IpcServer helper(
-    endpoint, std::chrono::seconds{idle_timeout}, greeting_format);
+  IpcServer helper(endpoint, std::chrono::seconds{idle_timeout});
   helper.run();
 
   log_msg("Shutdown complete");

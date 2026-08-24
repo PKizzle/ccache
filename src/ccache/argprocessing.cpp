@@ -90,10 +90,16 @@ public:
   bool found_md_or_mmd_opt = false;
   bool found_Wa_a_opt = false;
   bool rewrite_FI_args = false;
+  bool output_sarif_is_directory = false;
 
   std::string explicit_language;             // As specified with -x.
   std::string input_charset_option;          // -finput-charset=...
   std::string last_seen_msvc_z_debug_option; // /Z7, /Zi or /ZI
+
+  // Option that determines diagnostics format/output (-fdiagnostics-format=,
+  // -fdiagnostics-add-output= or -fdiagnostics-set-output=). We currently
+  // support at most one of them.
+  std::string seen_diagnostics_output_option;
 
   // Is the dependency file set via -Wp,-M[M]D,target or -MFtarget?
   OutputDepOrigin output_dep_origin = OutputDepOrigin::none;
@@ -181,6 +187,17 @@ color_output_possible()
   const char* term_env = getenv("TERM");
   return isatty(STDERR_FILENO) && term_env
          && util::to_lowercase(term_env) != "dumb";
+}
+
+bool
+is_wp_macro_option_list(std::string_view options)
+{
+  const auto is_macro_option = [](const auto option) {
+    return option.starts_with("-D") || option.starts_with("-U");
+  };
+  return std::ranges::all_of(
+    util::Tokenizer(options, ",", util::Tokenizer::Mode::include_empty),
+    is_macro_option);
 }
 
 bool
@@ -356,6 +373,124 @@ process_profiling_option(const Context& ctx,
   return true;
 }
 
+Statistic
+process_diagnostics_output_option(const Context& ctx,
+                                  ArgsInfo& args_info,
+                                  ArgumentProcessingState& state,
+                                  std::string_view arg)
+{
+  if (!state.seen_diagnostics_output_option.empty()) {
+    LOG("{} combined with {} is unsupported",
+        arg,
+        state.seen_diagnostics_output_option);
+    return Statistic::unsupported_compiler_option;
+  }
+  state.seen_diagnostics_output_option = arg;
+
+  if (arg.starts_with("-fdiagnostics-format=")) {
+    if (arg != "-fdiagnostics-format=text"
+        && arg != "-fdiagnostics-format=sarif-stderr") {
+      LOG("{} is unsupported", arg);
+      return Statistic::unsupported_compiler_option;
+    }
+    state.add_compiler_only_arg(arg);
+    return Statistic::none;
+  }
+
+  const auto output_spec = arg.substr(arg.find('=') + 1);
+  const auto [format, key_options] =
+    util::split_once_into_views(output_spec, ':');
+
+  if (format == "text") {
+    state.add_compiler_only_arg(arg);
+    return Statistic::none;
+  }
+
+  if (format != "sarif" || !key_options) {
+    LOG("{} is unsupported (only text and sarif are supported)", arg);
+    return Statistic::unsupported_compiler_option;
+  }
+
+  std::string rewritten_arg{arg};
+  for (const auto key_option : util::Tokenizer(*key_options, ",")) {
+    const auto [key, value] = util::split_once_into_views(key_option, '=');
+    if (key != "file") {
+      continue;
+    }
+    if (!value || value->empty()) {
+      LOG("{} is unsupported (missing key value)", arg);
+      return Statistic::unsupported_compiler_option;
+    }
+    if (!args_info.output_sarif.empty()) {
+      LOG("{} is unsupported (multiple file keys)", arg);
+      return Statistic::unsupported_compiler_option;
+    }
+    args_info.output_sarif = core::make_relative_path(ctx, *value);
+    const auto value_offset = value->data() - arg.data();
+    rewritten_arg.replace(
+      value_offset, value->size(), util::pstr(args_info.output_sarif));
+  }
+
+  if (args_info.output_sarif.empty()) {
+    LOG("{} is unsupported (missing file key)", arg);
+    return Statistic::unsupported_compiler_option;
+  }
+
+  state.add_compiler_only_arg(rewritten_arg);
+  return Statistic::none;
+}
+
+Statistic
+process_msvc_experimental_log_option(const Context& ctx,
+                                     ArgsInfo& args_info,
+                                     ArgumentProcessingState& state,
+                                     const util::Args& args,
+                                     size_t& args_index)
+{
+  constexpr std::string_view option = "-experimental:log";
+
+  if (!args_info.output_sarif.empty()) {
+    LOG("No support for multiple {}", option);
+    return Statistic::unsupported_compiler_option;
+  }
+
+  const auto original_arg = std::string_view(args[args_index]);
+  std::string_view output_arg;
+  if (original_arg.size() == option.size()) {
+    if (args_index + 1 == args.size()) {
+      LOG("Missing argument to {}", original_arg);
+      return Statistic::bad_compiler_arguments;
+    }
+    ++args_index;
+    output_arg = args[args_index];
+  } else {
+    output_arg = original_arg.substr(option.size());
+  }
+
+  if (output_arg.empty()) {
+    LOG("Missing argument to {}", original_arg.substr(0, option.size()));
+    return Statistic::bad_compiler_arguments;
+  }
+
+  state.output_sarif_is_directory = output_arg.ends_with('\\');
+  const auto rewritten_out = core::make_relative_path(ctx, output_arg);
+  std::string rewritten_out_str = util::pstr(rewritten_out);
+  if (state.output_sarif_is_directory && !rewritten_out_str.ends_with('\\')) {
+    rewritten_out_str += '\\';
+  }
+
+  state.add_compiler_only_arg(original_arg.substr(0, option.size()));
+  state.add_compiler_only_arg(rewritten_out_str);
+
+  if (state.output_sarif_is_directory) {
+    args_info.output_sarif = rewritten_out;
+  } else {
+    args_info.output_sarif = rewritten_out_str + ".sarif";
+  }
+
+  return Statistic::none;
+}
+
 std::string
 make_dash_option(const Config& config, const std::string& arg)
 {
@@ -374,6 +509,15 @@ is_msvc_z_debug_option(std::string_view arg)
   static const char* debug_options[] = {"-Z7", "-ZI", "-Zi"};
   return std::find(std::begin(debug_options), std::end(debug_options), arg)
          != std::end(debug_options);
+}
+
+bool
+is_msvc_show_includes_option(std::string_view arg)
+{
+  return arg == "-showIncludes"
+         || arg == "/showIncludes"
+         // clang-cl:
+         || arg == "-showIncludes:user" || arg == "/showIncludes:user";
 }
 
 // Returns std::nullopt if the option wasn't recognized, otherwise the error
@@ -1226,11 +1370,19 @@ process_option_arg(const Context& ctx,
     return Statistic::none;
   }
 
-  if (arg == "-showIncludes"
-      // clang-cl:
-      || arg == "-showIncludes:user") {
+  if (is_msvc_show_includes_option(arg)) {
     args_info.generating_includes = true;
     state.add_compiler_only_arg(args[i]);
+    return Statistic::none;
+  }
+
+  if (ctx.config.compiler_type() == CompilerType::nvcc
+      && (arg == "-Xcompiler" || arg == "--compiler-options")
+      && i < args.size() - 1 && is_msvc_show_includes_option(args[i + 1])) {
+    args_info.generating_includes = true;
+    state.add_compiler_only_arg(args[i]);
+    state.add_compiler_only_arg(args[i + 1]);
+    ++i;
     return Statistic::none;
   }
 
@@ -1305,7 +1457,17 @@ process_option_arg(const Context& ctx,
       // The failure is logged by process_profiling_option.
       return Statistic::unsupported_compiler_option;
     }
-    state.add_common_arg(args[i]);
+    if (arg.starts_with("-fprofile-use=")
+        || arg.starts_with("-fprofile-instr-use=")
+        || arg.starts_with("-fprofile-sample-use=")
+        || arg.starts_with("-fauto-profile=")) {
+      const auto [option, path] = util::split_once(args[i], '=');
+      DEBUG_ASSERT(path);
+      const auto relpath = core::make_relative_path(ctx, *path);
+      state.add_common_arg(FMT("{}={}", option, relpath));
+    } else {
+      state.add_common_arg(args[i]);
+    }
     return Statistic::none;
   }
 
@@ -1316,6 +1478,19 @@ process_option_arg(const Context& ctx,
     args_info.sanitize_ignorelists.emplace_back(*path);
     auto relpath = core::make_relative_path(ctx, *path);
     state.add_common_arg(FMT("{}={}", option, relpath));
+    return Statistic::none;
+  }
+
+  if (arg.starts_with("-fmodule-file=")) {
+    // -fmodule-file=<name>=<path> or -fmodule-file=<path> for explicit C++
+    // module imports.
+    constexpr std::string_view module_file_flag = "-fmodule-file=";
+    auto value = std::string_view(arg).substr(module_file_flag.size());
+    if (auto sep = value.find('='); sep != std::string_view::npos) {
+      value = value.substr(sep + 1); // drop the optional "<name>=" prefix
+    }
+    args_info.module_files.emplace_back(value);
+    state.add_common_arg(args[i]);
     return Statistic::none;
   }
 
@@ -1383,8 +1558,7 @@ process_option_arg(const Context& ctx,
       }
       state.add_compiler_only_arg(args[i]);
       return Statistic::none;
-    } else if ((arg.starts_with("-Wp,-D") || arg.starts_with("-Wp,-U"))
-               && arg.find(',', 6) == std::string::npos) {
+    } else if (is_wp_macro_option_list(arg.substr(4))) {
       state.add_common_arg(args[i]);
       return Statistic::none;
     } else if (arg == "-Wp,-MP"
@@ -1476,7 +1650,11 @@ process_option_arg(const Context& ctx,
     return Statistic::none;
   }
 
-  if (config.compiler_type() == CompilerType::gcc) {
+  if (config.is_compiler_group_msvc() && arg.starts_with("-experimental:log")) {
+    return process_msvc_experimental_log_option(ctx, args_info, state, args, i);
+  }
+
+  if (config.is_compiler_group_gcc()) {
     if (arg == "-fdiagnostics-color" || arg == "-fdiagnostics-color=always") {
       state.color_diagnostics = ColorDiagnostics::always;
       state.add_compiler_only_arg_no_hash(args[i]);
@@ -1512,6 +1690,12 @@ process_option_arg(const Context& ctx,
       state.add_compiler_only_arg_no_hash(args[i]);
       return Statistic::none;
     }
+  }
+
+  if (arg.starts_with("-fdiagnostics-format=")
+      || arg.starts_with("-fdiagnostics-add-output=")
+      || arg.starts_with("-fdiagnostics-set-output=")) {
+    return process_diagnostics_output_option(ctx, args_info, state, args[i]);
   }
 
   if (arg == "-fno-pch-timestamp") {
@@ -1712,9 +1896,13 @@ process_arg(const Context& ctx,
     return *statistic; // error found
   }
 
-  if (state.found_Yc && config.is_compiler_group_msvc()
+  if ((state.found_Yc || state.found_Yu) && config.is_compiler_group_msvc()
       && !config.base_dirs().empty()) {
-    LOG("Creating PCH with MSVC, disabling base directory");
+    if (state.found_Yc) {
+      LOG("Creating PCH with MSVC, disabling base directory");
+    } else {
+      LOG("Using PCH with MSVC, disabling base directory");
+    }
     config.set_base_dirs({});
     restart = true;
   }
@@ -2003,6 +2191,11 @@ process_args(Context& ctx)
   args_info.orig_output_obj = args_info.output_obj;
   args_info.output_obj = core::make_relative_path(ctx, args_info.output_obj);
 
+  if (state.output_sarif_is_directory) {
+    args_info.output_sarif /=
+      util::with_extension(args_info.input_file.filename(), ".sarif");
+  }
+
   // Determine a filepath for precompiled header.
   if (ctx.config.is_compiler_group_msvc() && args_info.generating_pch) {
     bool included_pch_file_by_source = args_info.included_pch_file.empty();
@@ -2053,8 +2246,10 @@ process_args(Context& ctx)
   if (!state.explicit_language.empty() && state.explicit_language == "none") {
     state.explicit_language.clear();
   }
+  const LanguageInfo* language_info = nullptr;
   if (!state.explicit_language.empty()) {
-    if (!language_is_supported(state.explicit_language)) {
+    language_info = language_info_for_language(state.explicit_language);
+    if (!language_info) {
       LOG("Unsupported language: {}", state.explicit_language);
       return tl::unexpected(Statistic::unsupported_source_language);
     }
@@ -2103,22 +2298,21 @@ process_args(Context& ctx)
     return tl::unexpected(Statistic::unsupported_source_language);
   }
 
+  if (!language_info) {
+    language_info = language_info_for_language(args_info.actual_language);
+  }
+  if (!language_info) {
+    LOG("Unsupported language: {}", args_info.actual_language);
+    return tl::unexpected(Statistic::unsupported_source_language);
+  }
+
   if (args_info.actual_language == "assembler"
       || args_info.actual_language == "ir") {
     // -MD/-MMD do not produce a dependency file.
     args_info.generating_dependencies = false;
   }
 
-  args_info.preprocess_input_file =
-    !language_is_preprocessed(args_info.actual_language);
-
-  if (!args_info.preprocess_input_file && ctx.config.cpp_extension().empty()) {
-    const auto extension = util::pstr(args_info.input_file.extension()).str();
-    config.set_cpp_extension(extension.empty() ? "i" : extension.substr(1));
-  } else if (config.cpp_extension().empty()) {
-    std::string p_language = p_language_for_language(args_info.actual_language);
-    config.set_cpp_extension(extension_for_language(p_language).substr(1));
-  }
+  args_info.preprocess_input_file = !language_info->preprocessed;
 
   if (args_info.seen_split_dwarf) {
     if (util::is_dev_null_path(args_info.output_obj)) {
@@ -2178,7 +2372,7 @@ process_args(Context& ctx)
     if (args_info.actual_language != "assembler") {
       diagnostics_color_arg = "-fcolor-diagnostics";
     }
-  } else if (config.compiler_type() == CompilerType::gcc) {
+  } else if (config.is_compiler_group_gcc()) {
     diagnostics_color_arg = "-fdiagnostics-color";
   } else {
     // Other compilers shouldn't output color, so no need to strip it.
@@ -2202,9 +2396,9 @@ process_args(Context& ctx)
         if (config.compiler_type() == CompilerType::clang) {
           // Clang does the sane thing: the dependency target is the output file
           // so that the dependency file actually makes sense.
-        } else if (config.compiler_type() == CompilerType::gcc) {
-          // GCC strangely uses the base name of the source file but with a .o
-          // extension.
+        } else if (config.is_compiler_group_gcc()) {
+          // GCC (and QCC) strangely uses the base name of the source file but
+          // with a .o extension.
           dep_target =
             util::with_extension(args_info.orig_input_file.filename(),
                                  get_default_object_file_extension(ctx.config));
@@ -2212,7 +2406,7 @@ process_args(Context& ctx)
           // How other compilers behave is currently unknown, so bail out.
           LOG(
             "-Wp,-M[M]D with -o without -MMD, -MQ or -MT is only supported for"
-            " GCC or Clang");
+            " GCC-like or Clang compilers");
           return tl::unexpected(Statistic::unsupported_compiler_option);
         }
       }
@@ -2282,11 +2476,20 @@ process_args(Context& ctx)
     state.add_compiler_only_arg_no_hash(*diagnostics_color_arg);
   }
 
-  if (ctx.config.depend_mode() && !args_info.generating_includes
-      && ctx.config.compiler_type() == CompilerType::msvc) {
-    ctx.auto_depend_mode = true;
-    args_info.generating_includes = true;
-    state.add_compiler_only_arg_no_hash("/showIncludes");
+  if (ctx.config.depend_mode() && !args_info.generating_includes) {
+    if (ctx.config.compiler_type() == CompilerType::msvc) {
+      ctx.auto_depend_mode = true;
+      args_info.generating_includes = true;
+      state.add_compiler_only_arg_no_hash("/showIncludes");
+    }
+#ifdef _WIN32
+    else if (ctx.config.compiler_type() == CompilerType::nvcc) {
+      ctx.auto_depend_mode = true;
+      args_info.generating_includes = true;
+      state.add_compiler_only_arg_no_hash("-Xcompiler");
+      state.add_compiler_only_arg_no_hash("/showIncludes");
+    }
+#endif
   }
 
   if (state.found_c_opt) {

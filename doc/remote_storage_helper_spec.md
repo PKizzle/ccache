@@ -46,9 +46,6 @@ The helper program will get startup parameters as environment variables:
 - `CRSH_IDLE_TIMEOUT`: Timeout (in seconds) for the storage helper to wait
   before exiting after client inactivity. If set to 0, the helper will stay up
   indefinitely and never exit due to inactivity.
-- `CRSH_FORMAT_MAX`: Maximum version of the protocol greeting message format
-  supported by the client as a positive integer. If not set, the storage helper
-  must use the default value `1`.
 
 Custom attributes from ccache's `remote_storage` configuration will also
 provided as environment variables:
@@ -86,6 +83,7 @@ This is a specification of the custom binary IPC protocol between ccache
 - `<byte>`: 1 byte
 - `<u8>`: unsigned 8-bit integer (1 byte)
 - `<u64>`: unsigned 64-bit integer in host byte order (8 bytes)
+- `<bool>`: 1 byte (0x00: false, 0x01: true)
 
 ### Common types
 
@@ -105,42 +103,32 @@ This is a specification of the custom binary IPC protocol between ccache
                                     ;   put: key/value not stored
                                     ;   remove: key/value not removed
 <err>             ::= 0x02 <msg>    ; e.g. bad parameters, network/server errors
-<capabilities>    ::= <cap_len> <cap_data>
-<cap_len>         ::= <u8>
-<cap_data>        ::= <cap>*        ; <cap_len> entries
-<cap>             ::= <cap0>        ; currently only one capability is defined
-<cap0>            ::= 0x00          ; get/put/remove/stop operations
 ```
+
+### Capabilities
+
+- 0x00: `get`/`put`/`remove` requests
+- 0x01: `info` request
+- 0x02: `exists` request
 
 ### Server greeting (server to client)
 
-In response to the client's startup parameters, the server sends a greeting to
-the client when the client has connected. The server must use the highest
-greeting message format that is supported by both sides. If the client's maximum
-greeting message format (`CRSH_FORMAT_MAX`) is lower than the lowest format the
-server supports, the server must close the connection.
-
-The client must verify server capabilities before sending any request.
-
-#### Greeting 1
+The server sends a greeting to the client when the client has connected. The
+client must verify protocol version and server capabilities before sending any
+request.
 
 ```
-<greeting_1>      ::= 0x01 <capabilities>
-```
-
-#### Greeting 2
-
-```
-<greeting_2>      ::= 0x02 <capabilities> <server_identity> <diagnostics>
-<server_identity> ::= <msg>              ; software name and version, etc.
-<diagnostics>     ::= <diag_num> <diag>* ; <diag_num> diagnostics messages
-<diag_num>        ::= <u8>
-<diag>            ::= <msg>              ; message to be logged by the client
+<greeting>        ::= <protocol_ver> <capabilities>
+<protocol_ver>    ::= 0x01          ; protocol version 1
+<capabilities>    ::= <cap_len> <cap_data>
+<cap_len>         ::= <u8>
+<cap_data>        ::= <cap>*        ; <cap_len> entries
+<cap>             ::= <byte>        ; see "Capabilities" above
 ```
 
 ### Requests (client to server with response from server)
 
-#### Get
+#### Get (capability 0x00)
 
 Get a value from remote storage.
 
@@ -149,7 +137,7 @@ Get a value from remote storage.
 <get_response>    ::= <ok> <value> | <noop> | <err>
 ```
 
-#### Put
+#### Put (capability 0x00)
 
 Put a value in remote storage.
 
@@ -159,7 +147,10 @@ Put a value in remote storage.
 <put_response>    ::= <ok> | <noop> | <err>
 ```
 
-#### Remove
+An unset overwrite flag is only a performance hint; it is OK if the value is
+sometimes or always overwritten anyway.
+
+#### Remove (capability 0x00)
 
 Remove a value from remote storage.
 
@@ -168,7 +159,7 @@ Remove a value from remote storage.
 <remove_response> ::= <ok> | <noop> | <err>
 ```
 
-#### Stop
+#### Stop (always available)
 
 Tell the server to shut down and exit. The server must terminate immediately
 without waiting for ongoing client operations to finish.
@@ -179,3 +170,26 @@ without waiting for ongoing client operations to finish.
 ```
 
 Note that the connection might be closed before `<stop_response>` can be read.
+
+#### Info (capability 0x01)
+
+Get information about the helper.
+
+```
+<info_request>    ::= 0x04
+<info_response>   ::= <server_identity> <diagnostics>
+<server_identity> ::= <msg>              ; software name and version, etc.
+<diagnostics>     ::= <diag_num> <diag>* ; <diag_num> diagnostics messages
+<diag_num>        ::= <u8>
+<diag>            ::= <msg>              ; message to be logged by the client
+```
+
+#### Exists (capability 0x02)
+
+Check if remote storage has a value.
+
+```
+<exists_request>  ::= 0x05 <key>
+<exists_response> ::= <ok> <exists> | <err>
+<exists>          ::= <bool>
+```

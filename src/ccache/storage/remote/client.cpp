@@ -32,16 +32,24 @@ constexpr uint8_t k_request_get = 0x00;
 constexpr uint8_t k_request_put = 0x01;
 constexpr uint8_t k_request_remove = 0x02;
 constexpr uint8_t k_request_stop = 0x03;
+constexpr uint8_t k_request_info = 0x04;
+constexpr uint8_t k_request_exists = 0x05;
 
 } // namespace
 
 static Client::Error
 make_error(const util::IpcError& ipc_error)
 {
-  auto failure = (ipc_error.failure == util::IpcError::Failure::timeout)
-                   ? Client::Failure::timeout
-                   : Client::Failure::error;
-  return Client::Error(failure, ipc_error.message);
+  switch (ipc_error.failure) {
+  case util::IpcError::Failure::error:
+    return Client::Error(Client::Failure::error, ipc_error.message);
+  case util::IpcError::Failure::permission_denied:
+    return Client::Error(Client::Failure::permission_denied, ipc_error.message);
+  case util::IpcError::Failure::timeout:
+    return Client::Error(Client::Failure::timeout, ipc_error.message);
+  default:
+    return Client::Error(Client::Failure::error, "internal error");
+  }
 }
 
 Client::Client(std::chrono::milliseconds data_timeout,
@@ -88,28 +96,21 @@ Client::connect(const std::string& path)
     return tl::unexpected(make_error(result.error()));
   }
 
-  TRY(read_greeting());
+  if (auto greeting_result = read_greeting(); !greeting_result) {
+    // Don't leave the channel connected, otherwise a later connect attempt
+    // would fail since the transport is still in use.
+    close();
+    return tl::unexpected(greeting_result.error());
+  }
 
   m_connected = true;
   return {};
 }
 
 uint8_t
-Client::greeting_format() const
+Client::protocol_version() const
 {
-  return m_greeting_format;
-}
-
-const std::string&
-Client::server_identity() const
-{
-  return m_server_identity;
-}
-
-const std::vector<std::string>&
-Client::diagnostics() const
-{
-  return m_diagnostics;
+  return m_protocol_version;
 }
 
 const std::vector<Client::Capability>&
@@ -125,17 +126,47 @@ Client::has_capability(Capability cap) const
          != m_capabilities.end();
 }
 
-tl::expected<std::optional<util::Bytes>, Client::Error>
-Client::get(std::span<const uint8_t> key)
+tl::expected<void, Client::Error>
+Client::verify_connected() const
 {
   if (!m_connected) {
     return tl::unexpected(Error(Failure::error, "Not connected"));
   }
+  return {};
+}
 
+tl::expected<void, Client::Error>
+Client::verify_key_size(std::span<const uint8_t> key)
+{
   if (key.size() > 255) {
     return tl::unexpected(
       Error(Failure::error, "Key too long (max 255 bytes)"));
   }
+  return {};
+}
+
+tl::expected<bool, Client::Error>
+Client::exists(std::span<const uint8_t> key)
+{
+  TRY(verify_connected());
+  TRY(verify_key_size(key));
+
+  m_request_start_time = std::chrono::steady_clock::now();
+
+  util::Bytes msg;
+  msg.reserve(2 + key.size());
+  msg.push_back(k_request_exists);
+  msg.push_back(static_cast<uint8_t>(key.size()));
+  msg.insert(msg.end(), key.data(), key.size());
+  TRY(send_bytes(msg));
+  return receive_response_exists();
+}
+
+tl::expected<std::optional<util::Bytes>, Client::Error>
+Client::get(std::span<const uint8_t> key)
+{
+  TRY(verify_connected());
+  TRY(verify_key_size(key));
 
   m_request_start_time = std::chrono::steady_clock::now();
 
@@ -149,19 +180,42 @@ Client::get(std::span<const uint8_t> key)
   return receive_response_get();
 }
 
+tl::expected<Client::InfoResponse, Client::Error>
+Client::info()
+{
+  TRY(verify_connected());
+
+  m_request_start_time = std::chrono::steady_clock::now();
+
+  util::Bytes msg({k_request_info});
+  TRY(send_bytes(msg));
+
+  Client::InfoResponse response;
+
+  TRY_ASSIGN(uint8_t identity_len, receive_u8());
+  TRY_ASSIGN(auto identity_bytes, receive_bytes(identity_len));
+  response.server_identity.assign(
+    reinterpret_cast<const char*>(identity_bytes.data()), identity_len);
+
+  TRY_ASSIGN(uint8_t diag_num, receive_u8());
+  response.diagnostics.reserve(diag_num);
+  for (uint8_t i = 0; i < diag_num; ++i) {
+    TRY_ASSIGN(uint8_t msg_len, receive_u8());
+    TRY_ASSIGN(auto msg_bytes, receive_bytes(msg_len));
+    response.diagnostics.emplace_back(
+      reinterpret_cast<const char*>(msg_bytes.data()), msg_len);
+  }
+
+  return response;
+}
+
 tl::expected<bool, Client::Error>
 Client::put(std::span<const uint8_t> key,
             std::span<const uint8_t> value,
             PutFlags flags)
 {
-  if (!m_connected) {
-    return tl::unexpected(Error(Failure::error, "Not connected"));
-  }
-
-  if (key.size() > 255) {
-    return tl::unexpected(
-      Error(Failure::error, "Key too long (max 255 bytes)"));
-  }
+  TRY(verify_connected());
+  TRY(verify_key_size(key));
 
   m_request_start_time = std::chrono::steady_clock::now();
 
@@ -178,20 +232,14 @@ Client::put(std::span<const uint8_t> key,
   header.insert(header.end(), len_bytes, sizeof(uint64_t));
   TRY(send_bytes(header));
   TRY(send_bytes(value));
-  return receive_response_bool();
+  return receive_response_ok_noop_error();
 }
 
 tl::expected<bool, Client::Error>
 Client::remove(std::span<const uint8_t> key)
 {
-  if (!m_connected) {
-    return tl::unexpected(Error(Failure::error, "Not connected"));
-  }
-
-  if (key.size() > 255) {
-    return tl::unexpected(
-      Error(Failure::error, "Key too long (max 255 bytes)"));
-  }
+  TRY(verify_connected());
+  TRY(verify_key_size(key));
 
   m_request_start_time = std::chrono::steady_clock::now();
 
@@ -201,15 +249,13 @@ Client::remove(std::span<const uint8_t> key)
   msg.push_back(static_cast<uint8_t>(key.size()));
   msg.insert(msg.end(), key.data(), key.size());
   TRY(send_bytes(msg));
-  return receive_response_bool();
+  return receive_response_ok_noop_error();
 }
 
 tl::expected<void, Client::Error>
 Client::stop()
 {
-  if (!m_connected) {
-    return tl::unexpected(Error(Failure::error, "Not connected"));
-  }
+  TRY(verify_connected());
 
   m_request_start_time = std::chrono::steady_clock::now();
 
@@ -221,25 +267,20 @@ Client::stop()
 void
 Client::close()
 {
-  if (m_connected) {
-    m_channel.close();
-    m_connected = false;
-    m_greeting_format = 0;
-    m_capabilities.clear();
-    m_server_identity.clear();
-    m_diagnostics.clear();
-  }
+  m_channel.close();
+  m_connected = false;
+  m_protocol_version = 0;
+  m_capabilities.clear();
 }
 
 tl::expected<void, Client::Error>
 Client::read_greeting()
 {
-  TRY_ASSIGN(m_greeting_format, receive_u8());
-  if (m_greeting_format != k_greeting_format_1
-      && m_greeting_format != k_greeting_format_2) {
+  TRY_ASSIGN(m_protocol_version, receive_u8());
+  if (m_protocol_version != k_protocol_version) {
     return tl::unexpected(
       Error(Failure::error,
-            FMT("Unsupported greeting format: {}", m_greeting_format)));
+            FMT("Unsupported protocol version: {}", m_protocol_version)));
   }
 
   TRY_ASSIGN(uint8_t cap_len, receive_u8());
@@ -248,23 +289,6 @@ Client::read_greeting()
   for (uint8_t i = 0; i < cap_len; ++i) {
     TRY_ASSIGN(uint8_t cap_byte, receive_u8());
     m_capabilities.push_back(static_cast<Capability>(cap_byte));
-  }
-
-  if (m_greeting_format == k_greeting_format_2) {
-    TRY_ASSIGN(uint8_t identity_len, receive_u8());
-    TRY_ASSIGN(auto identity_bytes, receive_bytes(identity_len));
-    m_server_identity.assign(
-      reinterpret_cast<const char*>(identity_bytes.data()), identity_len);
-
-    TRY_ASSIGN(uint8_t diag_num, receive_u8());
-    m_diagnostics.clear();
-    m_diagnostics.reserve(diag_num);
-    for (uint8_t i = 0; i < diag_num; ++i) {
-      TRY_ASSIGN(uint8_t msg_len, receive_u8());
-      TRY_ASSIGN(auto msg_bytes, receive_bytes(msg_len));
-      m_diagnostics.emplace_back(
-        reinterpret_cast<const char*>(msg_bytes.data()), msg_len);
-    }
   }
 
   return {};
@@ -323,6 +347,37 @@ Client::receive_u64()
   return value;
 }
 
+tl::expected<std::string, Client::Error>
+Client::receive_error_string()
+{
+  TRY_ASSIGN(uint8_t msg_len, receive_u8());
+  TRY_ASSIGN(auto msg_bytes, receive_bytes(msg_len));
+  return std::string(msg_bytes.begin(), msg_bytes.end());
+}
+
+tl::expected<bool, Client::Error>
+Client::receive_response_exists()
+{
+  TRY_ASSIGN(uint8_t status_byte, receive_u8());
+  auto status = static_cast<Status>(status_byte);
+
+  switch (status) {
+  case Status::ok: {
+    TRY_ASSIGN(uint8_t exists, receive_u8());
+    return exists;
+  }
+
+  case Status::error: {
+    TRY_ASSIGN(auto err_msg, receive_error_string());
+    return tl::unexpected(Error(Failure::error, err_msg));
+  }
+
+  default:
+    return tl::unexpected(
+      Error(Failure::error, FMT("Invalid status code: {}", status_byte)));
+  }
+}
+
 tl::expected<std::optional<util::Bytes>, Client::Error>
 Client::receive_response_get()
 {
@@ -340,10 +395,8 @@ Client::receive_response_get()
     return std::nullopt;
 
   case Status::error: {
-    TRY_ASSIGN(uint8_t msg_len, receive_u8());
-    TRY_ASSIGN(auto msg_bytes, receive_bytes(msg_len));
-    std::string error_msg(msg_bytes.begin(), msg_bytes.end());
-    return tl::unexpected(Error(Failure::error, error_msg));
+    TRY_ASSIGN(auto err_msg, receive_error_string());
+    return tl::unexpected(Error(Failure::error, err_msg));
   }
 
   default:
@@ -353,7 +406,7 @@ Client::receive_response_get()
 }
 
 tl::expected<bool, Client::Error>
-Client::receive_response_bool()
+Client::receive_response_ok_noop_error()
 {
   TRY_ASSIGN(uint8_t status_byte, receive_u8());
   auto status = static_cast<Status>(status_byte);
@@ -366,10 +419,8 @@ Client::receive_response_bool()
     return false;
 
   case Status::error: {
-    TRY_ASSIGN(uint8_t msg_len, receive_u8());
-    TRY_ASSIGN(auto msg_bytes, receive_bytes(msg_len));
-    std::string error_msg(msg_bytes.begin(), msg_bytes.end());
-    return tl::unexpected(Error(Failure::error, error_msg));
+    TRY_ASSIGN(auto err_msg, receive_error_string());
+    return tl::unexpected(Error(Failure::error, err_msg));
   }
 
   default:
@@ -393,10 +444,8 @@ Client::receive_response_void()
     return {};
 
   case Status::error: {
-    TRY_ASSIGN(uint8_t msg_len, receive_u8());
-    TRY_ASSIGN(auto msg_bytes, receive_bytes(msg_len));
-    std::string error_msg(msg_bytes.begin(), msg_bytes.end());
-    return tl::unexpected(Error(Failure::error, error_msg));
+    TRY_ASSIGN(auto err_msg, receive_error_string());
+    return tl::unexpected(Error(Failure::error, err_msg));
   }
 
   default:
