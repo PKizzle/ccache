@@ -1156,20 +1156,22 @@ write_result(Context& ctx,
     return false;
   }
 
-  // ISPC device-side offload stub (--dev-stub).
-  if (!ctx.args_info.ispc_dev_stub_file.empty()
-      && !serializer.add_file(core::result::FileType::ispc_dev_stub,
-                              ctx.args_info.ispc_dev_stub_file)) {
-    LOG("ISPC dev-stub file {} missing", ctx.args_info.ispc_dev_stub_file);
-    return false;
-  }
-
-  // ISPC host-side offload stub (--host-stub).
-  if (!ctx.args_info.ispc_host_stub_file.empty()
-      && !serializer.add_file(core::result::FileType::ispc_host_stub,
-                              ctx.args_info.ispc_host_stub_file)) {
-    LOG("ISPC host-stub file {} missing", ctx.args_info.ispc_host_stub_file);
-    return false;
+  // ISPC offload stubs (--dev-stub, --host-stub). ISPC ignores both when
+  // compiling for multiple targets.
+  const bool ispc_multi_target = !ctx.args_info.ispc_target_suffixes.empty();
+  if (!ispc_multi_target) {
+    if (!ctx.args_info.ispc_dev_stub_file.empty()
+        && !serializer.add_file(core::result::FileType::ispc_dev_stub,
+                                ctx.args_info.ispc_dev_stub_file)) {
+      LOG("ISPC dev-stub file {} missing", ctx.args_info.ispc_dev_stub_file);
+      return false;
+    }
+    if (!ctx.args_info.ispc_host_stub_file.empty()
+        && !serializer.add_file(core::result::FileType::ispc_host_stub,
+                                ctx.args_info.ispc_host_stub_file)) {
+      LOG("ISPC host-stub file {} missing", ctx.args_info.ispc_host_stub_file);
+      return false;
+    }
   }
 
   // ISPC nanobind wrapper (--nanobind-wrapper).
