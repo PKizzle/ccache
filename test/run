@@ -774,7 +774,7 @@ else
 fi
 
 if [ -n "$REAL_ISPC" ]; then
-    echo "ISPC compiler:    $($REAL_ISPC --version | head -n 1) ($REAL_ISPC)"
+    echo "ISPC compiler:    $("$REAL_ISPC" --version | head -n 1) ($REAL_ISPC)"
 else
     echo "ISPC compiler:    not available"
 fi
