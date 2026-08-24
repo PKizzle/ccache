@@ -105,7 +105,7 @@ using util::DirEntry;
 // different for the same input in a new ccache version, we can just change
 // this string. A typical example would be if the format of one of the files
 // stored in the cache changes in a backwards-incompatible way.
-const char HASH_PREFIX[] = "4-ispc1";
+const char HASH_PREFIX[] = "4";
 
 // Search for k_ccache_disable_token within the first
 // k_ccache_disable_search_limit bytes of the input file.

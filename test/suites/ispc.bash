@@ -1,5 +1,5 @@
 SUITE_ispc_PROBE() {
-    if [ -z "$REAL_ISPC" ]; then
+    if [ -z "$(find_compiler ispc)" ]; then
         echo "ispc is not available"
     fi
 }
@@ -23,8 +23,10 @@ EOF
 }
 
 SUITE_ispc() {
-    ispc_single="$CCACHE $REAL_ISPC --target=avx2-i32x8"
-    ispc_multi="$CCACHE $REAL_ISPC --target=sse4.2-i32x4,avx2-i32x8"
+    local real_ispc
+    real_ispc=$(find_compiler ispc)
+    ispc_single="$CCACHE $real_ispc --target=avx2-i32x8"
+    ispc_multi="$CCACHE $real_ispc --target=sse4.2-i32x4,avx2-i32x8"
 
     # -------------------------------------------------------------------------
     TEST "Single target"
