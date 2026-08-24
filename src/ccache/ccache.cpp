@@ -1616,7 +1616,7 @@ should_skip_preprocessor_mode_for_ispc(const Context& ctx)
   return should_use_depfile_result_key_for_ispc(ctx);
 }
 
-static util::Args
+util::Args
 get_preprocessor_args_for_cache_lookup(const Context& ctx,
                                        const util::Args& preprocessor_args)
 {

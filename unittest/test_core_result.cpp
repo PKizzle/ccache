@@ -17,16 +17,22 @@
 // Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
 
 #include <ccache/config.hpp>
+#include <ccache/context.hpp>
 #include <ccache/core/exceptions.hpp>
 #include <ccache/core/result.hpp>
+#include <ccache/core/resultretriever.hpp>
 #include <ccache/util/bytes.hpp>
 
 #include <doctest/doctest.h>
 
 #include <array>
 #include <cstdint>
+#include <filesystem>
 #include <limits>
 
+namespace fs = std::filesystem;
+
+using core::ResultRetriever;
 using core::result::Deserializer;
 using core::result::FileType;
 using core::result::Serializer;
@@ -119,6 +125,44 @@ TEST_CASE("Serializer rejects more than the uint8_t number of file entries")
 
   util::Bytes bytes;
   CHECK_THROWS_AS(serializer.serialize(bytes), core::Error);
+}
+
+TEST_CASE("ResultRetriever maps ISPC multi-target files by entry order")
+{
+  Context ctx;
+  ctx.args_info.output_obj = "sub/test.o";
+  ctx.args_info.ispc_header_file = "sub/test_ispc.h";
+  ctx.args_info.ispc_target_suffixes = {"_sse4", "_avx2"};
+
+  ResultRetriever retriever(ctx);
+
+  CHECK(retriever.get_dest_path(FileType::object) == "sub/test.o");
+  CHECK(retriever.get_dest_path(FileType::ispc_header) == "sub/test_ispc.h");
+
+  CHECK(retriever.get_dest_path(FileType::ispc_target_object)
+        == fs::path("sub") / "test_sse4.o");
+  CHECK(retriever.get_dest_path(FileType::ispc_target_object)
+        == fs::path("sub") / "test_avx2.o");
+  // No third target: the entry is dropped rather than written to a wrong name.
+  CHECK(retriever.get_dest_path(FileType::ispc_target_object).empty());
+
+  CHECK(retriever.get_dest_path(FileType::ispc_target_header)
+        == fs::path("sub") / "test_ispc_sse4.h");
+  CHECK(retriever.get_dest_path(FileType::ispc_target_header)
+        == fs::path("sub") / "test_ispc_avx2.h");
+  CHECK(retriever.get_dest_path(FileType::ispc_target_header).empty());
+}
+
+TEST_CASE("ResultRetriever drops ISPC target headers when -h is absent")
+{
+  Context ctx;
+  ctx.args_info.output_obj = "test.o";
+  ctx.args_info.ispc_target_suffixes = {"_sse4", "_avx2"};
+
+  ResultRetriever retriever(ctx);
+
+  CHECK(retriever.get_dest_path(FileType::ispc_target_object) == "test_sse4.o");
+  CHECK(retriever.get_dest_path(FileType::ispc_target_header).empty());
 }
 
 TEST_SUITE_END();

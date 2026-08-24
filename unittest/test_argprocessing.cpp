@@ -1699,7 +1699,7 @@ TEST_CASE("ISPC --emit-obj is accepted")
   CHECK(result);
 }
 
-TEST_CASE("ISPC -M without -MF still works")
+TEST_CASE("ISPC -M without -MF writes dependencies to stdout, not a file")
 {
   TestContext test_context;
   Context ctx;
@@ -1710,7 +1710,130 @@ TEST_CASE("ISPC -M without -MF still works")
   const auto result = process_args(ctx);
 
   CHECK(result);
+  CHECK_FALSE(ctx.args_info.generating_dependencies);
+}
+
+TEST_CASE("ISPC -MF without -M produces no dependency file")
+{
+  TestContext test_context;
+  Context ctx;
+  ctx.config.set_compiler_type(CompilerType::ispc);
+  ctx.orig_args = Args::from_string(
+    "ispc -o test.o --target=avx2-i32x8 -MF test.o.d test.ispc");
+  REQUIRE(util::write_file("test.ispc", ""));
+  const auto result = process_args(ctx);
+
+  CHECK(result);
+  CHECK_FALSE(ctx.args_info.generating_dependencies);
+}
+
+TEST_CASE("ISPC -MMM keeps its dependency file name")
+{
+  TestContext test_context;
+  Context ctx;
+  ctx.config.set_compiler_type(CompilerType::ispc);
+  ctx.orig_args = Args::from_string(
+    "ispc -o test.o --target=avx2-i32x8 -MMM deps.txt test.ispc");
+  REQUIRE(util::write_file("test.ispc", ""));
+  const auto result = process_args(ctx);
+
+  CHECK(result);
   CHECK(ctx.args_info.generating_dependencies);
+  CHECK(ctx.args_info.output_dep == "deps.txt");
+  CHECK(ctx.args_info.ispc_flat_deps);
+}
+
+TEST_CASE("ISPC -MMM disables depend mode")
+{
+  TestContext test_context;
+  Context ctx;
+  ctx.config.set_compiler_type(CompilerType::ispc);
+  ctx.config.set_depend_mode(true);
+  ctx.orig_args = Args::from_string(
+    "ispc -o test.o --target=avx2-i32x8 -MMM deps.txt test.ispc");
+  REQUIRE(util::write_file("test.ispc", ""));
+  const auto result = process_args(ctx);
+
+  CHECK(result);
+  CHECK_FALSE(ctx.config.depend_mode());
+}
+
+TEST_CASE("ISPC -MMM missing argument")
+{
+  TestContext test_context;
+  Context ctx;
+  ctx.config.set_compiler_type(CompilerType::ispc);
+  ctx.orig_args =
+    Args::from_string("ispc -o test.o --target=avx2-i32x8 test.ispc -MMM");
+  REQUIRE(util::write_file("test.ispc", ""));
+  const auto result = process_args(ctx);
+
+  CHECK(!result);
+  CHECK(result.error() == Statistic::bad_compiler_arguments);
+}
+
+TEST_CASE("ISPC target suffixes match Target::ISAToString")
+{
+  struct
+  {
+    const char* target;
+    const char* suffix;
+  } const cases[] = {
+    {"sse2-i32x4",     "_sse2"      },
+    {"sse4.1-i32x8",   "_sse4"      },
+    {"sse4.2-i32x4",   "_sse4"      },
+    {"avx1-i32x8",     "_avx"       },
+    {"avx2-i32x8",     "_avx2"      },
+    {"avx2vnni-i32x8", "_avx2vnni"  },
+    {"avx512skx-x16",  "_avx512skx" },
+    {"avx512icl-x16",  "_avx512icl" },
+    {"avx512spr-x16",  "_avx512spr" },
+    {"avx512gnr-x16",  "_avx512gnr" },
+    {"avx10.2dmr-x16", "_avx10_2dmr"},
+    {"avx10.2nvl-x8",  "_avx10_2nvl"},
+    {"neon-i32x4",     "_neon"      },
+    {"vsx-i32x4",      "_vsx"       },
+    {"rvv-x4",         "_rv64gcv"   },
+    {"wasm-i32x4",     "_wasm"      },
+    {"xehpg-x16",      "_xehpg"     },
+    {"xe2lpg-x32",     "_xe2lpg"    },
+  };
+
+  for (const auto& [target, suffix] : cases) {
+    TestContext test_context;
+    Context ctx;
+    ctx.config.set_compiler_type(CompilerType::ispc);
+    // A second target is needed since single-target builds produce no extra
+    // output files and therefore no suffixes.
+    ctx.orig_args = Args::from_string(
+      FMT("ispc -o test.o --target={},generic-i32x8 test.ispc", target));
+    REQUIRE(util::write_file("test.ispc", ""));
+    const auto result = process_args(ctx);
+
+    CHECK(result);
+    REQUIRE(ctx.args_info.ispc_target_suffixes.size() == 2);
+    CHECK(ctx.args_info.ispc_target_suffixes[0] == suffix);
+  }
+}
+
+TEST_CASE("ISPC flags without dedicated handling are hashed and forwarded")
+{
+  TestContext test_context;
+  Context ctx;
+  ctx.config.set_compiler_type(CompilerType::ispc);
+  ctx.orig_args = Args::from_string(
+    "ispc -o test.o --target=avx2-i32x8 --opt=fast-math --woff --pic"
+    " --math-lib=fast -O2 test.ispc");
+  REQUIRE(util::write_file("test.ispc", ""));
+  const auto result = process_args(ctx);
+
+  REQUIRE(result);
+  CHECK(result->preprocessor_args.to_string()
+        == "ispc --target=avx2-i32x8 --opt=fast-math --woff --pic"
+           " --math-lib=fast -O2");
+  CHECK(result->compiler_args.to_string()
+        == "ispc --target=avx2-i32x8 --opt=fast-math --woff --pic"
+           " --math-lib=fast -O2");
 }
 
 TEST_CASE("ISPC --dev-stub is supported")
