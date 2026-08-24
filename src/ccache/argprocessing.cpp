@@ -771,106 +771,14 @@ process_option_arg(const Context& ctx,
       return Statistic::none;
     }
 
-    // ISPC-specific options that affect compilation output.
-    if (arg.starts_with("--opt=") || arg.starts_with("--math-lib=")
-        || arg.starts_with("--mcmodel=") || arg.starts_with("--target-os=")
-        || arg == "--pic" || arg == "--PIC" || arg == "--dllexport"
-        || arg == "--vectorcall" || arg == "--no-vectorcall"
-        || arg == "--instrument" || arg == "--stack-protector"
-        || arg.starts_with("--stack-protector=") || arg == "--nostdlib"
-        || arg == "--no-pragma-once" || arg == "--include-float16-conversions"
-        || arg == "--wrap-signed-int" || arg == "--no-wrap-signed-int"
-        || arg.starts_with("--addressing=") || arg.starts_with("--arch=")
-        || arg.starts_with("--cpu=") || arg.starts_with("--device=")
-        || arg.starts_with("-f") || arg.starts_with("-O")) {
-      state.add_common_arg(args[i]);
-      return Statistic::none;
-    }
-
-    // ISPC --dwarf-version and -g options.
-    if (arg.starts_with("--dwarf-version=")
-        || arg == "--sample-profiling-debug-info"
-        || arg == "--no-omit-frame-pointer") {
-      state.add_common_arg(args[i]);
-      return Statistic::none;
-    }
-
-    // ISPC --quiet, --woff, --werror, --wno-perf.
-    if (arg == "--quiet" || arg == "--woff" || arg == "--werror"
-        || arg == "--wno-perf") {
-      state.add_common_arg(args[i]);
-      return Statistic::none;
-    }
-
-    // ISPC --x86-asm-syntax.
-    if (arg.starts_with("--x86-asm-syntax=")) {
-      state.add_common_arg(args[i]);
-      return Statistic::none;
-    }
-
-    // ISPC --version.
-    if (arg == "--version") {
-      LOG("ISPC option {} is unsupported", args[i]);
+    // ISPC options that print information and exit without producing output.
+    if (arg == "--version" || arg == "--support-matrix" || arg == "--help"
+        || arg == "--help-dev") {
       return Statistic::called_for_preprocessing;
     }
 
-    // ISPC --support-matrix.
-    if (arg == "--support-matrix") {
-      LOG("ISPC option {} is unsupported", args[i]);
-      return Statistic::called_for_preprocessing;
-    }
-
-    // ISPC --help and --help-dev.
-    if (arg == "--help" || arg == "--help-dev") {
-      return Statistic::called_for_preprocessing;
-    }
-
-    // ISPC --profile-sample-use takes a file argument.
-    if (arg == "--profile-sample-use"
-        || arg.starts_with("--profile-sample-use=")) {
-      if (arg == "--profile-sample-use") {
-        if (i == args.size() - 1) {
-          LOG("Missing argument to {}", args[i]);
-          return Statistic::bad_compiler_arguments;
-        }
-        state.add_common_arg(args[i]);
-        state.add_common_arg(args[i + 1]);
-        i++;
-      } else {
-        state.add_common_arg(args[i]);
-      }
-      return Statistic::none;
-    }
-
-    // ISPC -dM and -dD affect preprocessor output.
-    if (arg == "-dM" || arg == "-dD") {
-      state.add_common_arg(args[i]);
-      return Statistic::none;
-    }
-
-    // ISPC --ignore-preprocessor-errors.
-    if (arg == "--ignore-preprocessor-errors") {
-      state.add_common_arg(args[i]);
-      return Statistic::none;
-    }
-
-    // ISPC --enable-llvm-intrinsics.
-    if (arg == "--enable-llvm-intrinsics") {
-      state.add_common_arg(args[i]);
-      return Statistic::none;
-    }
-
-    // ISPC --error-limit.
-    if (arg.starts_with("--error-limit=")) {
-      state.add_common_arg(args[i]);
-      return Statistic::none;
-    }
-
-    // ISPC --force-alignment.
-    if (arg.starts_with("--force-alignment=")) {
-      state.add_common_arg(args[i]);
-      return Statistic::none;
-    }
+    // Every other ISPC option is a flag or an --opt=value form with no separate
+    // argument, so the generic handling below hashes and forwards it correctly.
   }
 
   // Handle "@file" argument.
