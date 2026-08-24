@@ -1772,6 +1772,8 @@ TEST_CASE("ISPC -MMM missing argument")
   CHECK(result.error() == Statistic::bad_compiler_arguments);
 }
 
+// Suffix spellings are stable from ISPC 1.25 on, except that 1.30 renamed
+// the avx10.2 ISA from "avx10.2*" to "avx10_2*".
 TEST_CASE("ISPC target suffixes match Target::ISAToString")
 {
   struct
