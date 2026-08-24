@@ -1977,6 +1977,11 @@ ispc_target_suffix(const std::string& target)
     return "_sse4";
   }
 
+  // The rvv-x4 target resolves to the RV64GCV ISA.
+  if (isa_base == "rvv") {
+    return "_rv64gcv";
+  }
+
   // For all other targets (including avx10.2dmr), dots in the ISA name become
   // underscores in the file suffix.
   std::replace(isa_base.begin(), isa_base.end(), '.', '_');
