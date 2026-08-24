@@ -637,26 +637,29 @@ process_option_arg(const Context& ctx,
       return Statistic::none;
     }
 
-    // ISPC -MMM writes dependencies to a file (different from GCC -MMD).
+    // ISPC -MMM <file> writes a bare newline-separated list of includes, with
+    // no make rule. Unrelated to GCC's -MMD.
     if (arg == "-MMM") {
       if (i == args.size() - 1) {
         LOG("Missing argument to {}", args[i]);
         return Statistic::bad_compiler_arguments;
       }
       args_info.generating_dependencies = true;
-      args_info.output_dep = args[i + 1];
+      args_info.ispc_flat_deps = true;
+      if (state.output_dep_origin <= OutputDepOrigin::mf) {
+        state.output_dep_origin = OutputDepOrigin::mf;
+        args_info.output_dep = core::make_relative_path(ctx, args[i + 1]);
+      }
       state.add_compiler_only_arg(args[i]);
-      state.add_compiler_only_arg(args[i + 1]);
+      state.add_compiler_only_arg(args_info.output_dep);
       i++;
       return Statistic::none;
     }
 
-    // ISPC -M generates make-style dependencies. Unlike GCC's -M which only
-    // outputs deps without compiling, ISPC's -M works alongside --emit-obj
-    // and still produces the object file.  CMake's Ninja generator appends
-    // "-M -MT $out -MF $DEP_FILE" to every ISPC invocation.  We must handle
-    // these here before they reach the general processing where -M is marked
-    // TOO_HARD (which is correct for GCC but wrong for ISPC).
+    // ISPC -M emits a make rule and still compiles, unlike GCC's -M, which is
+    // why it must be handled before the generic TOO_HARD check. Without -MF the
+    // rule goes to stdout, so no dependency file is produced; see the ISPC
+    // block after the argument loop.
     if (arg == "-M") {
       args_info.generating_dependencies = true;
       state.found_md_or_mmd_opt = true;
@@ -2076,11 +2079,25 @@ process_args(Context& ctx)
       || state.found_syntax_only || state.found_analyze_opt
       || config.compiler_type() == CompilerType::ispc);
 
-  // For ISPC, compute multi-target suffixes from the --target argument.
   if (config.compiler_type() == CompilerType::ispc) {
     const auto target_info = compute_ispc_target_info(args);
     args_info.ispc_target_suffixes = target_info.suffixes;
     args_info.ispc_first_target = target_info.first_target;
+
+    // ISPC only writes a dependency file when -MF or -MMM names one; -M on its
+    // own sends the make rule to stdout.
+    if (args_info.generating_dependencies
+        && state.output_dep_origin == OutputDepOrigin::none) {
+      LOG("ISPC -M without -MF writes dependencies to stdout");
+      args_info.generating_dependencies = false;
+    }
+
+    // The -MMM format has no make rule, so it cannot serve as the include list
+    // that depend mode derives the result key from.
+    if (args_info.ispc_flat_deps && config.depend_mode()) {
+      LOG("Disabling depend mode since ISPC -MMM deps have no make rule");
+      config.set_depend_mode(false);
+    }
   }
 
   if (state.input_files.empty()) {

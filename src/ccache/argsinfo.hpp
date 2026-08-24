@@ -209,4 +209,8 @@ struct ArgsInfo
   // ISPC first target from --target, used when falling back to preprocessing
   // a multi-target invocation via a single-target -E pass.
   std::string ispc_first_target;
+
+  // Whether the ISPC dependency file was requested with -MMM, whose flat
+  // format carries no make rule and cannot be parsed as an include list.
+  bool ispc_flat_deps = false;
 };

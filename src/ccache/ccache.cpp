@@ -1604,7 +1604,8 @@ static bool
 should_use_depfile_result_key_for_ispc(const Context& ctx)
 {
   return ctx.config.compiler_type() == CompilerType::ispc
-         && ctx.args_info.generating_dependencies;
+         && ctx.args_info.generating_dependencies
+         && !ctx.args_info.ispc_flat_deps;
 }
 
 static bool
