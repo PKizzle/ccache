@@ -96,6 +96,10 @@ public:
   bool rewrite_FI_args = false;
   bool output_sarif_is_directory = false;
 
+  // clang-cl /clang:<arg> options in command line order, processed after all
+  // other options since clang-cl appends them to the end of the command line.
+  std::vector<std::string> clang_cl_forwarded_args;
+
   std::string explicit_language;             // As specified with -x.
   std::string input_charset_option;          // -finput-charset=...
   std::string last_seen_msvc_z_debug_option; // /Z7, /Zi or /ZI
@@ -608,9 +612,9 @@ process_option_arg(const Context& ctx,
       && arg.starts_with("-clang:")) {
     // clang-cl's /clang:<arg> option forwards any arg to the clang driver.
     // Also, they are treated as if they were passed at the end of the command
-    // line. Too hard for now.
-    LOG("Compiler option {} is unsupported", args[i]);
-    return Statistic::unsupported_compiler_option;
+    // line, so defer them to process_clang_cl_forwarded_args.
+    state.clang_cl_forwarded_args.push_back(args[i]);
+    return Statistic::none;
   }
 
   if (arg == "-ivfsoverlay"
@@ -1924,6 +1928,84 @@ process_option_arg(const Context& ctx,
   return std::nullopt;
 }
 
+// Process the clang-cl /clang:<arg> options collected by process_option_arg.
+// clang-cl forwards the <arg> parts, in order, to the end of the clang driver
+// command line, so an option's separate value is the next /clang: option. Only
+// options known to be handled correctly are accepted, the rest are too hard.
+Statistic
+process_clang_cl_forwarded_args(const Context& ctx,
+                                ArgsInfo& args_info,
+                                ArgumentProcessingState& state)
+{
+  // Length of the "-clang:" or "/clang:" prefix.
+  constexpr size_t prefix_len = 7;
+  const auto& args = state.clang_cl_forwarded_args;
+
+  for (size_t i = 0; i < args.size(); ++i) {
+    const std::string_view arg = std::string_view(args[i]).substr(prefix_len);
+
+    // Options that only affect the compilation result: language standard,
+    // optimization level and warnings (but not the -Wa,/-Wl,/-Wp, pass-through
+    // options).
+    if (arg.starts_with("-std=") || arg.starts_with("-O")
+        || (arg.starts_with("-W") && arg.find(',') == std::string_view::npos)) {
+      state.add_common_arg(args[i]);
+      continue;
+    }
+
+    if (arg == "-MD" || arg == "-MMD") {
+      state.found_md_or_mmd_opt = true;
+      args_info.generating_dependencies = true;
+      state.add_compiler_only_arg(args[i]);
+      continue;
+    }
+
+    // -MF, -MT and -MQ with the value either joined or as the next /clang:
+    // option. Like hash_argument does for GCC-style compilers, only the option
+    // and not the value is hashed.
+    const auto option = arg.substr(0, 3);
+    if (option != "-MF" && option != "-MT" && option != "-MQ") {
+      LOG("Compiler option {} is unsupported", args[i]);
+      return Statistic::unsupported_compiler_option;
+    }
+    const bool separate_value = arg.size() == 3;
+    if (separate_value && i + 1 == args.size()) {
+      LOG("Missing argument to {}", args[i]);
+      return Statistic::bad_compiler_arguments;
+    }
+    const std::string& value_arg = separate_value ? args[i + 1] : args[i];
+    const size_t value_pos = prefix_len + (separate_value ? 0 : 3);
+    std::string value = value_arg.substr(value_pos);
+
+    if (option == "-MF") {
+      state.found_mf_opt = true;
+      value = util::pstr(core::make_relative_path(ctx, value)).str();
+      if (state.output_dep_origin <= OutputDepOrigin::mf) {
+        state.output_dep_origin = OutputDepOrigin::mf;
+        args_info.output_dep = value;
+      }
+    } else {
+      if (args_info.dependency_target) {
+        args_info.dependency_target->push_back(' ');
+      } else {
+        args_info.dependency_target = "";
+      }
+      *args_info.dependency_target +=
+        option == "-MQ" ? depfile::escape_filename(value) : value;
+    }
+
+    state.add_extra_args_to_hash(args[i].substr(0, prefix_len + 3));
+    if (separate_value) {
+      state.add_compiler_only_arg_no_hash(args[i]);
+      ++i;
+    }
+    state.add_compiler_only_arg_no_hash(
+      FMT("{}{}", value_arg.substr(0, value_pos), value));
+  }
+
+  return Statistic::none;
+}
+
 Statistic
 process_arg(const Context& ctx,
             ArgsInfo& args_info,
@@ -2112,6 +2194,14 @@ process_args(Context& ctx)
 
     if (!restart) {
       break;
+    }
+  }
+
+  if (!argument_error && !state.clang_cl_forwarded_args.empty()) {
+    const auto statistic =
+      process_clang_cl_forwarded_args(ctx, args_info, state);
+    if (statistic != Statistic::none) {
+      argument_error = statistic;
     }
   }
 

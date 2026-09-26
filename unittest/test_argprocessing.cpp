@@ -1573,7 +1573,101 @@ TEST_CASE("-clang: is too hard")
   const auto result = process_args(ctx);
   REQUIRE(!result);
   CHECK(result.error() == Statistic::unsupported_compiler_option);
-  
+}
+
+TEST_CASE("clang-cl /clang: options")
+{
+  TestContext test_context;
+  Context ctx;
+
+  ctx.config.set_compiler_type(CompilerType::clang_cl);
+  REQUIRE(util::write_file("foo.c", ""));
+
+  SUBCASE("-std=, -W and -O are hashed and passed to preprocessor and compiler")
+  {
+    ctx.orig_args = Args::from_string(
+      "clang-cl /clang:-std=c++23 -c foo.c /W4 -clang:-Wno-foo -clang:-O2");
+    const auto result = process_args(ctx);
+    REQUIRE(result);
+    // /clang: options are moved to the end, like clang-cl does.
+    CHECK(result->preprocessor_args.to_string()
+          == "clang-cl /W4 /clang:-std=c++23 -clang:-Wno-foo -clang:-O2");
+    CHECK(result->compiler_args.to_string()
+          == "clang-cl /W4 /clang:-std=c++23 -clang:-Wno-foo -clang:-O2"
+             " -fcolor-diagnostics -c");
+    CHECK(!ctx.args_info.generating_dependencies);
+  }
+
+  SUBCASE("-MD with separate -MT and -MF values")
+  {
+    REQUIRE(fs::create_directory("obj"));
+    ctx.orig_args = Args::from_string(
+      "clang-cl -clang:-MD -clang:-MT -clang:obj/foo.obj -clang:-MF"
+      " -clang:foo.d -c foo.c -Foobj/foo.obj");
+    const auto result = process_args(ctx);
+    REQUIRE(result);
+    CHECK(ctx.args_info.generating_dependencies);
+    CHECK(ctx.args_info.output_dep == "foo.d");
+    CHECK(ctx.args_info.dependency_target == "obj/foo.obj");
+    CHECK(result->preprocessor_args.to_string() == "clang-cl");
+    CHECK(result->extra_args_to_hash.to_string()
+          == "-clang:-MD -clang:-MT -clang:-MF");
+    CHECK(result->compiler_args.to_string()
+          == "clang-cl -clang:-MD -clang:-MT -clang:obj/foo.obj"
+             " -clang:-MF -clang:foo.d -fcolor-diagnostics -c");
+  }
+
+  SUBCASE("-MMD with joined -MQ and -MF values, last -MF wins")
+  {
+    ctx.orig_args = Args::from_string(
+      "clang-cl /clang:-MMD /clang:-MQa$b /clang:-MFx.d -c foo.c"
+      " /clang:-MFy.d");
+    const auto result = process_args(ctx);
+    REQUIRE(result);
+    CHECK(ctx.args_info.generating_dependencies);
+    CHECK(ctx.args_info.output_dep == "y.d");
+    CHECK(ctx.args_info.dependency_target == "a$$b");
+    CHECK(result->extra_args_to_hash.to_string()
+          == "/clang:-MMD /clang:-MQ /clang:-MF /clang:-MF");
+    CHECK(result->compiler_args.to_string()
+          == "clang-cl /clang:-MMD /clang:-MQa$b /clang:-MFx.d /clang:-MFy.d"
+             " -fcolor-diagnostics -c");
+  }
+
+  SUBCASE("-MD without -MF and -MT uses defaults based on the object file")
+  {
+    ctx.orig_args = Args::from_string("clang-cl -clang:-MD -c foo.c");
+    const auto result = process_args(ctx);
+    REQUIRE(result);
+    CHECK(ctx.args_info.output_dep == "foo.d");
+    CHECK(ctx.args_info.dependency_target == "foo.obj");
+  }
+
+  SUBCASE("Missing value is an error")
+  {
+    ctx.orig_args = Args::from_string("clang-cl -clang:-MF -c foo.c");
+    const auto result = process_args(ctx);
+    REQUIRE(!result);
+    CHECK(result.error() == Statistic::bad_compiler_arguments);
+  }
+
+  SUBCASE("Unknown options are too hard")
+  {
+    for (const auto* option : {"-clang:-o",
+                               "-clang:-E",
+                               "-clang:-M",
+                               "-clang:-Wp,-MD,x.d",
+                               "-clang:-save-temps"}) {
+      CAPTURE(option);
+      ctx.orig_args = Args::from_string("clang-cl -c foo.c");
+      ctx.orig_args.push_back(option);
+      const auto result = process_args(ctx);
+      REQUIRE(!result);
+      CHECK(result.error() == Statistic::unsupported_compiler_option);
+    }
+  }
+}
+
 TEST_CASE("ISPC basic compilation")
 {
   TestContext test_context;
