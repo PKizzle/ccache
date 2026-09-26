@@ -197,7 +197,10 @@ win32execute(const char* const* argv,
       LOG("Failed to write {}: {}", tmp_file.path, r.error());
       return std::nullopt;
     }
-    commandline = FMT(R"("{}" "@{}")", argv[0], tmp_file.path);
+    // nvcc rejects @file and only reads arguments via --options-file.
+    commandline = guess_compiler(argv[0]) == CompilerType::nvcc
+                    ? FMT(R"("{}" --options-file "{}")", argv[0], tmp_file.path)
+                    : FMT(R"("{}" "@{}")", argv[0], tmp_file.path);
     tmp_file_path = tmp_file.path;
   }
 
