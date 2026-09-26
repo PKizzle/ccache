@@ -43,8 +43,10 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <iterator>
 #include <optional>
+#include <system_error>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -89,12 +91,16 @@ public:
   bool found_wp_md_or_mmd_opt = false;
   bool found_md_or_mmd_opt = false;
   bool found_Wa_a_opt = false;
+  bool found_msvc_assembler_listing_opt = false;
+  bool msvc_assembler_listing_path_is_directory = false;
   bool rewrite_FI_args = false;
   bool output_sarif_is_directory = false;
 
   std::string explicit_language;             // As specified with -x.
   std::string input_charset_option;          // -finput-charset=...
   std::string last_seen_msvc_z_debug_option; // /Z7, /Zi or /ZI
+  std::string msvc_assembler_listing_extension;
+  fs::path msvc_assembler_listing_path;
 
   // Option that determines diagnostics format/output (-fdiagnostics-format=,
   // -fdiagnostics-add-output= or -fdiagnostics-set-output=). We currently
@@ -521,6 +527,46 @@ is_msvc_show_includes_option(std::string_view arg)
          || arg == "-showIncludes:user" || arg == "/showIncludes:user";
 }
 
+// Returns the module files in `dir` that an import can resolve to, sorted so
+// that the hash does not depend on the order the directory is read in, or an
+// error if it cannot be determined which files the compilation reads.
+tl::expected<std::vector<fs::path>, Statistic>
+find_module_files(const fs::path& dir)
+{
+  std::vector<fs::path> module_files;
+  try {
+    for (const auto& entry : fs::directory_iterator(dir)) {
+      // A case-insensitive file system serves any spelling of the extension to
+      // the compiler, which looks for <dir>/<module-name>.pcm.
+      if (util::to_lowercase(util::pstr(entry.path().extension()).str())
+          != ".pcm") {
+        continue;
+      }
+      // Anything the compiler cannot read as a module file is not an input: a
+      // directory can be named like one, and a symlink can dangle. The error
+      // code keeps the query from throwing.
+      std::error_code entry_ec;
+      if (entry.is_regular_file(entry_ec)) {
+        module_files.push_back(entry.path());
+      }
+    }
+  } catch (const std::filesystem::filesystem_error& e) {
+    if (e.code() == std::errc::no_such_file_or_directory
+        || e.code() == std::errc::not_a_directory) {
+      // A path that is missing or is not a directory has no module files for
+      // an import to resolve to.
+      return std::vector<fs::path>{};
+    }
+    // Any other failure, including one that ends the scan part way through,
+    // leaves it unknown which files the compilation reads. Advancing the
+    // iterator throws, which would otherwise take down the whole invocation.
+    LOG("Failed to read prebuilt module path {}: {}", dir, e.what());
+    return tl::unexpected(Statistic::could_not_use_modules);
+  }
+  std::sort(module_files.begin(), module_files.end());
+  return module_files;
+}
+
 // Returns std::nullopt if the option wasn't recognized, otherwise the error
 // code (with Statistic::none for "no error").
 std::optional<Statistic>
@@ -929,6 +975,48 @@ process_option_arg(const Context& ctx,
         }
       }
     }
+    if (state.found_Wa_a_opt && state.found_msvc_assembler_listing_opt) {
+      LOG("Multiple assembler listing options are not supported");
+      return Statistic::unsupported_compiler_option;
+    }
+  }
+
+  if (config.is_compiler_group_msvc() && arg.starts_with("-FA")) {
+    if (state.found_Wa_a_opt) {
+      LOG("Multiple assembler listing options are not supported");
+      return Statistic::unsupported_compiler_option;
+    }
+    state.found_msvc_assembler_listing_opt = true;
+    state.msvc_assembler_listing_extension =
+      config.compiler_type() == CompilerType::msvc
+          && arg.substr(3).find('c') != std::string_view::npos
+        ? ".cod"
+        : ".asm";
+    state.add_compiler_only_arg(args[i]);
+    return Statistic::none;
+  }
+
+  if (config.is_compiler_group_msvc() && arg.starts_with("-Fa")) {
+    if (state.found_Wa_a_opt) {
+      LOG("Multiple assembler listing options are not supported");
+      return Statistic::unsupported_compiler_option;
+    }
+    state.found_msvc_assembler_listing_opt = true;
+
+    const std::string_view path = std::string_view(arg).substr(3);
+    state.msvc_assembler_listing_path_is_directory =
+      path.ends_with('/') || path.ends_with('\\');
+    state.msvc_assembler_listing_path =
+      path.empty() ? fs::path{} : core::make_relative_path(ctx, path);
+
+    std::string rewritten_path = util::pstr(state.msvc_assembler_listing_path);
+    if (state.msvc_assembler_listing_path_is_directory
+        && !rewritten_path.ends_with('/') && !rewritten_path.ends_with('\\')) {
+      rewritten_path += path.back();
+    }
+    state.add_compiler_only_arg_no_hash(
+      FMT("{}{}", std::string_view(args[i]).substr(0, 3), rewritten_path));
+    return Statistic::none;
   }
 
   // Handle options that should not be passed to the preprocessor.
@@ -1399,6 +1487,41 @@ process_option_arg(const Context& ctx,
     args_info.sanitize_ignorelists.emplace_back(*path);
     auto relpath = core::make_relative_path(ctx, *path);
     state.add_common_arg(FMT("{}={}", option, relpath));
+    return Statistic::none;
+  }
+
+  if (arg == "-fprebuilt-implicit-modules"
+      && !config.sloppiness().contains(core::Sloppy::modules)) {
+    // Clang looks up implicit modules in a subdirectory layout named by
+    // hashes of compiler internals, so the module files read by the
+    // compilation cannot be determined.
+    LOG("You have to specify \"modules\" sloppiness when using {} to get hits",
+        args[i]);
+    return Statistic::could_not_use_modules;
+  }
+
+  if (arg.starts_with("-fprebuilt-module-path=")) {
+    // Clang resolves an import by looking for <dir>/<module-name>.pcm, not
+    // descending into subdirectories. The command line does not say which of
+    // those files the compilation reads, so all of them are hashed. This costs
+    // a hit when an unrelated module file in the same directory changes.
+    constexpr std::string_view prebuilt_module_path_flag =
+      "-fprebuilt-module-path=";
+    const std::string_view dir_arg =
+      std::string_view(arg).substr(prebuilt_module_path_flag.size());
+    // Clang resolves an empty value against the working directory, so the
+    // module files there are read and have to be hashed.
+    const fs::path dir(dir_arg.empty() ? std::string_view(".") : dir_arg);
+
+    auto module_files = find_module_files(dir);
+    if (!module_files) {
+      return module_files.error();
+    }
+    for (auto& module_file : *module_files) {
+      args_info.searched_module_files.push_back(std::move(module_file));
+    }
+
+    state.add_common_arg(args[i]);
     return Statistic::none;
   }
 
@@ -2130,6 +2253,26 @@ process_args(Context& ctx)
 
   args_info.orig_output_obj = args_info.output_obj;
   args_info.output_obj = core::make_relative_path(ctx, args_info.output_obj);
+
+  if (state.found_msvc_assembler_listing_opt) {
+    args_info.output_al = state.msvc_assembler_listing_path;
+    const bool output_al_by_source =
+      args_info.output_al.empty()
+      || state.msvc_assembler_listing_path_is_directory;
+    if (output_al_by_source) {
+      args_info.output_al /= args_info.input_file.filename();
+    }
+    const std::string_view extension =
+      state.msvc_assembler_listing_extension.empty()
+        ? std::string_view{".asm"}
+        : std::string_view{state.msvc_assembler_listing_extension};
+    if (output_al_by_source) {
+      args_info.output_al =
+        util::with_extension(args_info.output_al, extension);
+    } else if (!args_info.output_al.has_extension()) {
+      args_info.output_al = util::add_extension(args_info.output_al, extension);
+    }
+  }
 
   if (state.output_sarif_is_directory) {
     args_info.output_sarif /=

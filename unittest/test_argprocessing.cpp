@@ -33,6 +33,7 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <vector>
 
 namespace fs = util::filesystem;
 
@@ -988,6 +989,114 @@ TEST_CASE("clang-cl /experimental:log")
   CHECK(ctx.args_info.output_sarif == "report.sarif");
   CHECK(result->compiler_args.to_string()
         == "clang-cl.exe /experimental:log report -fcolor-diagnostics /c");
+}
+
+TEST_CASE("MSVC assembler listing options")
+{
+  TestContext test_context;
+  Context ctx;
+  REQUIRE(util::write_file("foo.c", ""));
+
+  SUBCASE("MSVC default output")
+  {
+    ctx.config.set_compiler_type(CompilerType::msvc);
+    ctx.orig_args = Args::from_string("cl.exe /FA /c foo.c");
+
+    const auto result = process_args(ctx);
+
+    REQUIRE(result);
+    CHECK(ctx.args_info.output_al == "foo.asm");
+    CHECK(result->preprocessor_args.to_string() == "cl.exe");
+    CHECK(result->compiler_args.to_string() == "cl.exe /FA /c");
+    CHECK(result->extra_args_to_hash.to_string() == "/FA");
+  }
+
+  SUBCASE("MSVC machine code output")
+  {
+    ctx.config.set_compiler_type(CompilerType::msvc);
+    ctx.orig_args = Args::from_string("cl.exe /FAcsu /c foo.c");
+
+    const auto result = process_args(ctx);
+
+    REQUIRE(result);
+    CHECK(ctx.args_info.output_al == "foo.cod");
+  }
+
+  SUBCASE("clang-cl machine code output")
+  {
+    ctx.config.set_compiler_type(CompilerType::clang_cl);
+    ctx.orig_args = Args::from_string("clang-cl.exe /FAcsu /c foo.c");
+
+    const auto result = process_args(ctx);
+
+    REQUIRE(result);
+    CHECK(ctx.args_info.output_al == "foo.asm");
+  }
+
+  SUBCASE("Explicit output enables listing and is not hashed")
+  {
+    ctx.config.set_compiler_type(CompilerType::msvc);
+    ctx.orig_args = Args::from_string("cl.exe /Fafoo /c foo.c");
+
+    const auto result = process_args(ctx);
+
+    REQUIRE(result);
+    CHECK(ctx.args_info.output_al == "foo.asm");
+    CHECK(result->compiler_args.to_string() == "cl.exe /Fafoo /c");
+    CHECK(result->extra_args_to_hash.to_string().empty());
+  }
+
+  SUBCASE("Custom extension")
+  {
+    ctx.config.set_compiler_type(CompilerType::msvc);
+    ctx.orig_args = Args::from_string("cl.exe /FAc /Fafoo.lst /c foo.c");
+
+    const auto result = process_args(ctx);
+
+    REQUIRE(result);
+    CHECK(ctx.args_info.output_al == "foo.lst");
+  }
+
+  SUBCASE("Output directory")
+  {
+    ctx.config.set_compiler_type(CompilerType::msvc);
+    ctx.orig_args = Args::from_string("cl.exe /FA /Falistings/ /c foo.c");
+
+    const auto result = process_args(ctx);
+
+    REQUIRE(result);
+    CHECK(ctx.args_info.output_al == "listings/foo.asm");
+    CHECK(result->compiler_args.to_string() == "cl.exe /FA /Falistings/ /c");
+  }
+
+  SUBCASE("Last options win")
+  {
+    ctx.config.set_compiler_type(CompilerType::msvc);
+    ctx.orig_args =
+      Args::from_string("cl.exe /FAc /FAs /Fafirst.asm /Fasecond /c foo.c");
+
+    const auto result = process_args(ctx);
+
+    REQUIRE(result);
+    CHECK(ctx.args_info.output_al == "second.asm");
+    CHECK(result->extra_args_to_hash.to_string() == "/FAc /FAs");
+  }
+
+  SUBCASE("MSVC option before assembler option")
+  {
+    ctx.config.set_compiler_type(CompilerType::clang_cl);
+    ctx.orig_args =
+      Args::from_string("clang-cl.exe /FA -Wa,-a=file.lst /c foo.c");
+    CHECK(process_args(ctx).error() == Statistic::unsupported_compiler_option);
+  }
+
+  SUBCASE("Assembler option before MSVC option")
+  {
+    ctx.config.set_compiler_type(CompilerType::clang_cl);
+    ctx.orig_args =
+      Args::from_string("clang-cl.exe -Wa,-a=file.lst /FA /c foo.c");
+    CHECK(process_args(ctx).error() == Statistic::unsupported_compiler_option);
+  }
 }
 
 TEST_CASE("MSVC PCH options")
@@ -2050,6 +2159,196 @@ TEST_CASE("ISPC -MT missing argument")
   const auto result = process_args(ctx);
 
   CHECK_FALSE(result);
+}
+
+TEST_CASE("-fprebuilt-module-path= hashes the module files in the directory")
+{
+  TestContext test_context;
+  Context ctx;
+  REQUIRE(util::write_file("foo.cpp", ""));
+  REQUIRE(fs::create_directory("pm"));
+  REQUIRE(util::write_file("pm/b.pcm", ""));
+  REQUIRE(util::write_file("pm/a.pcm", ""));
+  REQUIRE(util::write_file("pm/notes.txt", ""));
+
+  ctx.orig_args =
+    Args::from_string("clang -fprebuilt-module-path=pm -c foo.cpp");
+
+  const auto result = process_args(ctx);
+
+  REQUIRE(result);
+  // Sorted, so that the hash does not depend on the order the directory is
+  // read in.
+  CHECK(ctx.args_info.searched_module_files
+        == std::vector<fs::path>{"pm/a.pcm", "pm/b.pcm"});
+}
+
+TEST_CASE("-fprebuilt-module-path= hashes an uppercase module file extension")
+{
+  TestContext test_context;
+  Context ctx;
+  REQUIRE(util::write_file("foo.cpp", ""));
+  REQUIRE(fs::create_directory("pm"));
+  REQUIRE(util::write_file("pm/a.PCM", ""));
+
+  ctx.orig_args =
+    Args::from_string("clang -fprebuilt-module-path=pm -c foo.cpp");
+
+  const auto result = process_args(ctx);
+
+  REQUIRE(result);
+  // On a case-insensitive file system the compiler looking for pm/a.pcm reads
+  // this file.
+  CHECK(ctx.args_info.searched_module_files
+        == std::vector<fs::path>{"pm/a.PCM"});
+}
+
+TEST_CASE("-fprebuilt-module-path= ignores a .pcm directory")
+{
+  TestContext test_context;
+  Context ctx;
+  REQUIRE(util::write_file("foo.cpp", ""));
+  REQUIRE(fs::create_directory("pm"));
+  REQUIRE(util::write_file("pm/a.pcm", ""));
+  REQUIRE(fs::create_directory("pm/sub.pcm"));
+
+  ctx.orig_args =
+    Args::from_string("clang -fprebuilt-module-path=pm -c foo.cpp");
+
+  const auto result = process_args(ctx);
+
+  REQUIRE(result);
+  CHECK(ctx.args_info.searched_module_files
+        == std::vector<fs::path>{"pm/a.pcm"});
+}
+
+TEST_CASE("-fprebuilt-module-path= without a directory searches the CWD")
+{
+  TestContext test_context;
+  Context ctx;
+  REQUIRE(util::write_file("foo.cpp", ""));
+  REQUIRE(util::write_file("a.pcm", ""));
+
+  // Clang resolves an empty value against the working directory.
+  ctx.orig_args = Args::from_string("clang -fprebuilt-module-path= -c foo.cpp");
+
+  const auto result = process_args(ctx);
+
+  REQUIRE(result);
+  CHECK(ctx.args_info.searched_module_files
+        == std::vector<fs::path>{"./a.pcm"});
+}
+
+TEST_CASE("-fprebuilt-module-path= for a missing directory has no inputs")
+{
+  TestContext test_context;
+  Context ctx;
+  REQUIRE(util::write_file("foo.cpp", ""));
+
+  ctx.orig_args =
+    Args::from_string("clang -fprebuilt-module-path=absent -c foo.cpp");
+
+  const auto result = process_args(ctx);
+
+  REQUIRE(result);
+  CHECK(ctx.args_info.searched_module_files.empty());
+}
+
+TEST_CASE("-fprebuilt-module-path= naming a file has no inputs")
+{
+  TestContext test_context;
+  Context ctx;
+  REQUIRE(util::write_file("foo.cpp", ""));
+  REQUIRE(util::write_file("notadir", ""));
+
+  ctx.orig_args =
+    Args::from_string("clang -fprebuilt-module-path=notadir -c foo.cpp");
+
+  const auto result = process_args(ctx);
+
+  REQUIRE(result);
+  CHECK(ctx.args_info.searched_module_files.empty());
+}
+
+#ifndef _WIN32
+TEST_CASE("-fprebuilt-module-path= for an unreadable directory is uncacheable")
+{
+  if (geteuid() == 0) {
+    // Root reads the directory regardless of its permissions.
+    return;
+  }
+  TestContext test_context;
+  Context ctx;
+  REQUIRE(util::write_file("foo.cpp", ""));
+  REQUIRE(fs::create_directory("pm"));
+  REQUIRE(util::write_file("pm/a.pcm", ""));
+  REQUIRE(chmod("pm", 0000) == 0);
+
+  ctx.orig_args =
+    Args::from_string("clang -fprebuilt-module-path=pm -c foo.cpp");
+
+  const auto result = process_args(ctx);
+
+  // Which module files the compilation reads cannot be determined, so caching
+  // it could give a hit for a changed input.
+  REQUIRE(!result);
+  CHECK(result.error() == Statistic::could_not_use_modules);
+
+  REQUIRE(chmod("pm", 0700) == 0);
+}
+
+TEST_CASE("-fprebuilt-module-path= ignores an unreadable module file")
+{
+  TestContext test_context;
+  Context ctx;
+  REQUIRE(util::write_file("foo.cpp", ""));
+  REQUIRE(fs::create_directory("pm"));
+  REQUIRE(util::write_file("pm/a.pcm", ""));
+  // The compiler cannot read a dangling symlink either, so it is not an input
+  // and must not make the compilation uncacheable.
+  REQUIRE(fs::create_symlink("missing", "pm/b.pcm"));
+
+  ctx.orig_args =
+    Args::from_string("clang -fprebuilt-module-path=pm -c foo.cpp");
+
+  const auto result = process_args(ctx);
+
+  REQUIRE(result);
+  CHECK(ctx.args_info.searched_module_files
+        == std::vector<fs::path>{"pm/a.pcm"});
+}
+#endif
+
+TEST_CASE("-fprebuilt-implicit-modules is uncacheable")
+{
+  TestContext test_context;
+  Context ctx;
+  REQUIRE(util::write_file("foo.cpp", ""));
+
+  ctx.orig_args =
+    Args::from_string("clang -fprebuilt-implicit-modules -c foo.cpp");
+
+  const auto result = process_args(ctx);
+
+  REQUIRE(!result);
+  CHECK(result.error() == Statistic::could_not_use_modules);
+}
+
+TEST_CASE("-fprebuilt-implicit-modules is cacheable with modules sloppiness")
+{
+  TestContext test_context;
+  Context ctx;
+  ctx.config.update_from_map({
+    {"sloppiness", "modules"}
+  });
+  REQUIRE(util::write_file("foo.cpp", ""));
+
+  ctx.orig_args =
+    Args::from_string("clang -fprebuilt-implicit-modules -c foo.cpp");
+
+  const auto result = process_args(ctx);
+
+  CHECK(result);
 }
 
 TEST_SUITE_END();

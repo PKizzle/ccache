@@ -234,6 +234,11 @@ directory to a certain size, use `CCACHE_MAXSIZE=_SIZE_ ccache -c`.
     LRU (least recently used) using the file modification timestamp.
 --
 
+*--trim-marker* _PATH_::
+
+    Speed up repeated `--trim-recompress` runs by skipping files whose
+    modification time is older than the marker file at _PATH_.
+
 *--trim-recompress* _LEVEL_::
 
     Recompress to level _LEVEL_ using the Zstandard algorithm when using
@@ -243,7 +248,8 @@ directory to a certain size, use `CCACHE_MAXSIZE=_SIZE_ ccache -c`.
     _<<Cache compression>>_ for more information. This can potentially take a
     long time since all files in the cache need to be visited. Only files that
     are currently compressed with a different level than _LEVEL_ will be
-    recompressed.
+    recompressed. To avoid revisiting unchanged files on subsequent runs, see
+    `--trim-marker`.
 
 
 === Options for scripting or debugging
@@ -1202,9 +1208,11 @@ NOTE: No effect with `--coverage` (it implies `-fprofile-arcs`).
 
 *modules*::
 
-    *Use case*: Clang builds using `-fmodules`. +
+    *Use case*: Clang builds using `-fmodules` or
+    `-fprebuilt-implicit-modules`. +
     *Effect*: Allows caching when C++ modules are used. +
-    *Trade-off*: May not detect changes in module internal state.
+    *Trade-off*: May not detect changes in module internal state, or in
+    implicitly built modules.
 +
 See _<<C++ modules>>_ for details.
 
@@ -2042,6 +2050,24 @@ NOTE: The preprocessor mode doesn't provide enough information for module
 support <<The depend mode,*depend mode*>>. When using <<The preprocessor
 mode,the preprocessor mode>> Clang does not provide enough information to allow
 hashing of `module.modulemap` files.
+
+
+=== Explicit module files
+
+Regardless of the above, ccache hashes the module files that a compilation
+reads, so that a consumer is recompiled when a module it imports changes. This
+works for the options that tell ccache which files those are:
+
+* `-fmodule-file=`, which gives the path directly.
+* `-fprebuilt-module-path=`, whose directory Clang searches for
+  `<module-name>.pcm`. The command line doesn't say which of those files the
+  compilation reads, so all of them are hashed, names as well as contents. This
+  costs a hit when an unrelated module file in the same directory changes.
+
+`-fprebuilt-implicit-modules` compilations are counted as "`Could not use
+modules`" unless <<config_sloppiness,*sloppiness*>> is set to `modules`. Clang
+looks up implicit modules in a subdirectory layout named by hashes of compiler
+internals, so ccache can't tell which files the compilation reads.
 
 
 == Sharing a local cache
