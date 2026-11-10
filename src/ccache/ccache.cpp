@@ -2056,22 +2056,26 @@ hash_native_args(Context& ctx, const util::Args& native_args, Hash& hash)
   return {};
 }
 
-static std::tuple<std::optional<std::string_view>, std::optional<std::string>>
+// Options forwarded by clang-cl's /clang:<arg> have the prefix "-clang:" on
+// the processed command line, including separate values.
+static std::string_view
+without_clang_cl_prefix(std::string_view arg)
+{
+  if (arg.starts_with("-clang:")) {
+    arg.remove_prefix(7);
+  }
+  return arg;
+}
+
+static std::tuple<std::optional<std::string_view>,
+                  std::optional<std::string_view>>
 get_option_and_value(std::string_view option, const util::Args& args, size_t& i)
 {
-  // Handle MSVC slash and clang-cl passthrough options
-  auto arg = args[i];
-  if (arg.starts_with('/')) {
-    arg[0] = '-';
-  }
-  if (arg.starts_with("-clang:")) {
-    arg = arg.substr(7);
-  }
-
+  const auto arg = without_clang_cl_prefix(args[i]);
   if (arg == option) {
     if (i + 1 < args.size()) {
       ++i;
-      return {option, arg};
+      return {option, without_clang_cl_prefix(args[i])};
     } else {
       return {std::nullopt, std::nullopt};
     }
@@ -2101,7 +2105,7 @@ hash_argument(const Context& ctx,
     return {};
   }
 
-  const auto arg = make_dash_option(ctx.config, args[i]);
+  const auto arg = without_clang_cl_prefix(args[i]);
 
   // -L doesn't affect compilation (except for clang).
   if (i < args.size() - 1 && arg == "-L" && !is_clang) {
@@ -2229,7 +2233,7 @@ hash_argument(const Context& ctx,
   if (direct_mode) {
     std::optional<std::string_view> path;
     if (compopt_takes_path(arg) && i + 1 < args.size()) {
-      path = args[i + 1];
+      path = without_clang_cl_prefix(args[i + 1]);
     } else {
       auto p = compopt_prefix_takes_path(arg);
       if (p) {
@@ -2247,11 +2251,11 @@ hash_argument(const Context& ctx,
       // Skip the dependency filename since it doesn't impact the output.
       if (arg.starts_with("-Wp,-MD,")
           && arg.find(',', 8) == std::string::npos) {
-        hash.hash(args[i].data(), 8);
+        hash.hash(arg.data(), 8);
         return {};
       } else if (arg.starts_with("-Wp,-MMD,")
                  && arg.find(',', 9) == std::string::npos) {
-        hash.hash(args[i].data(), 9);
+        hash.hash(arg.data(), 9);
         return {};
       }
     } else {
@@ -2362,12 +2366,13 @@ hash_argument(const Context& ctx,
   }
 
   if (arg == "-Xclang" && i + 3 < args.size()
-      && make_dash_option(ctx.config, args[i + 1]) == "-load"
-      && make_dash_option(ctx.config, args[i + 2]) == "-Xclang") {
-    DirEntry dir_entry(args[i + 3], DirEntry::LogOnError::yes);
+      && without_clang_cl_prefix(args[i + 1]) == "-load"
+      && without_clang_cl_prefix(args[i + 2]) == "-Xclang") {
+    const std::string plugin(without_clang_cl_prefix(args[i + 3]));
+    DirEntry dir_entry(plugin, DirEntry::LogOnError::yes);
     if (dir_entry.is_regular_file()) {
       hash.hash_delimiter("plugin");
-      TRY(hash_compiler(ctx, hash, dir_entry, args[i + 3], false));
+      TRY(hash_compiler(ctx, hash, dir_entry, plugin, false));
       i += 3;
       return {};
     }
