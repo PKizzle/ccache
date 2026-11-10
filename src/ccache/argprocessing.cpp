@@ -191,12 +191,46 @@ private:
   util::Args m_native_args;
 };
 
+#ifdef _WIN32
+bool
+stderr_is_console()
+{
+  DWORD mode;
+  return GetConsoleMode(reinterpret_cast<HANDLE>(_get_osfhandle(STDERR_FILENO)),
+                        &mode);
+}
+
+// Try to enable virtual terminal processing for the console attached to stderr.
+// Returns true if the console supports virtual terminal sequences afterwards.
+bool
+enable_virtual_terminal_processing()
+{
+#  ifdef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+  HANDLE handle = reinterpret_cast<HANDLE>(_get_osfhandle(STDERR_FILENO));
+  DWORD mode;
+  if (!GetConsoleMode(handle, &mode)) {
+    return false;
+  }
+  return (mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+         || SetConsoleMode(handle,
+                           mode | ENABLE_PROCESSED_OUTPUT
+                             | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+#  else
+  return false;
+#  endif
+}
+#endif
+
 bool
 color_output_possible()
 {
+#ifdef _WIN32
+  return stderr_is_console();
+#else
   const char* term_env = getenv("TERM");
   return isatty(STDERR_FILENO) && term_env
          && util::to_lowercase(term_env) != "dumb";
+#endif
 }
 
 bool
@@ -537,6 +571,12 @@ is_msvc_show_includes_option(std::string_view arg)
 tl::expected<std::vector<fs::path>, Statistic>
 find_module_files(const fs::path& dir)
 {
+  // A path that is missing or is not a directory has no module files for an
+  // import to resolve to.
+  if (!fs::is_directory(dir)) {
+    return std::vector<fs::path>{};
+  }
+
   std::vector<fs::path> module_files;
   try {
     for (const auto& entry : fs::directory_iterator(dir)) {
@@ -555,15 +595,10 @@ find_module_files(const fs::path& dir)
       }
     }
   } catch (const std::filesystem::filesystem_error& e) {
-    if (e.code() == std::errc::no_such_file_or_directory
-        || e.code() == std::errc::not_a_directory) {
-      // A path that is missing or is not a directory has no module files for
-      // an import to resolve to.
-      return std::vector<fs::path>{};
-    }
-    // Any other failure, including one that ends the scan part way through,
-    // leaves it unknown which files the compilation reads. Advancing the
-    // iterator throws, which would otherwise take down the whole invocation.
+    // Any failure while iterating, including one that ends the scan part way
+    // through, leaves it unknown which files the compilation reads. Advancing
+    // the iterator throws, which would otherwise take down the whole
+    // invocation.
     LOG("Failed to read prebuilt module path {}: {}", dir, e.what());
     return tl::unexpected(Statistic::could_not_use_modules);
   }
@@ -2531,10 +2566,11 @@ process_args(Context& ctx)
     state.add_common_arg(state.explicit_language);
   }
 
-  args_info.strip_diagnostics_colors =
+  const bool colors_enabled =
     state.color_diagnostics != ColorDiagnostics::automatic
-      ? state.color_diagnostics == ColorDiagnostics::never
-      : !color_output_possible();
+      ? state.color_diagnostics == ColorDiagnostics::always
+      : color_output_possible();
+  args_info.strip_diagnostics_colors = !colors_enabled;
 
   // Since output is redirected, compilers will not color their output by
   // default, so force it explicitly.
@@ -2551,6 +2587,15 @@ process_args(Context& ctx)
     // Other compilers shouldn't output color, so no need to strip it.
     args_info.strip_diagnostics_colors = false;
   }
+
+#ifdef _WIN32
+  if (diagnostics_color_arg && colors_enabled && stderr_is_console()) {
+    // Fall back to translating colors to Win32 console operations if the
+    // console doesn't support virtual terminal sequences.
+    args_info.translate_diagnostics_colors =
+      !enable_virtual_terminal_processing();
+  }
+#endif
 
   if (args_info.generating_dependencies) {
     if (state.output_dep_origin == OutputDepOrigin::none) {

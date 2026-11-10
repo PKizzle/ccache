@@ -24,6 +24,7 @@
 #include <ccache/util/cpu.hpp>
 #include <ccache/util/file.hpp>
 #include <ccache/util/format.hpp>
+#include <ccache/util/string.hpp>
 
 #include <doctest/doctest.h>
 
@@ -181,6 +182,39 @@ check_temporal_macros(SourceCodePatternChecker check)
 
 TEST_SUITE_BEGIN("hashutil");
 
+TEST_CASE("hash_binary_file")
+{
+  TestContext test_context;
+  Context ctx;
+  ctx.config.set_inode_cache(false);
+
+  SUBCASE("Missing file")
+  {
+    CHECK(!hash_binary_file(ctx, "missing"));
+  }
+
+  SUBCASE("Empty file")
+  {
+    REQUIRE(util::write_file("empty", ""));
+    const auto digest = hash_binary_file(ctx, "empty");
+    REQUIRE(digest);
+    CHECK(*digest == Hash().digest());
+  }
+
+  SUBCASE("Binary data spanning multiple read buffers")
+  {
+    std::string data(2 * CCACHE_READ_BUFFER_SIZE + 17, '\0');
+    for (size_t i = 0; i < data.size(); ++i) {
+      data[i] = static_cast<char>(i % 256);
+    }
+    data.replace(100, 8, "__TIME__");
+    REQUIRE(util::write_file("binary", util::to_span(data)));
+    const auto digest = hash_binary_file(ctx, "binary");
+    REQUIRE(digest);
+    CHECK(*digest == Hash().hash(data).digest());
+  }
+}
+
 TEST_CASE("hash_command_output_simple")
 {
   TestContext test_context;
@@ -281,6 +315,16 @@ TEST_CASE("hash_multicommand_output_error_handling")
   CHECK(!hash_multicommand_output(h2, "false; true", "not used"));
 }
 
+TEST_CASE("find_clang_cc1_triple")
+{
+  CHECK(find_clang_cc1_triple(
+          " \"clang-cl.exe\" \"-cc1\" \"-triple\" "
+          "\"x86_64-pc-windows-msvc19.44.35229\" \"-emit-pch\"\n")
+        == "x86_64-pc-windows-msvc19.44.35229");
+  CHECK(find_clang_cc1_triple("clang version 19.1.7\n").empty());
+  CHECK(find_clang_cc1_triple(" \"-cc1\" \"-triple\" \"x86_64").empty());
+}
+
 TEST_CASE("check_for_temporal_macros")
 {
   TestContext test_context;
@@ -369,6 +413,30 @@ TEST_CASE("check_for_source_code_patterns: macro-expanded embed operand")
 #endif
 
   CHECK(result.contains(SourceCodeScan::found_embed));
+}
+
+TEST_CASE("check_for_source_code_patterns: macro-expanded incbin operand")
+{
+  TestContext test_context;
+
+  const std::string source = FMT(".inc{}bin RESOURCE\n", "");
+  SourceCodeScanResult result;
+
+  SUBCASE("scalar")
+  {
+    result = check_for_source_code_patterns_scalar(source);
+  }
+
+#ifdef HAVE_AVX2
+  if (util::cpu_supports_avx2()) {
+    SUBCASE("avx2")
+    {
+      result = check_for_source_code_patterns_avx2(source);
+    }
+  }
+#endif
+
+  CHECK(result.contains(SourceCodeScan::found_incbin));
 }
 
 #ifdef HAVE_AVX2
@@ -522,7 +590,7 @@ TEST_CASE("check_for_source_code_patterns_avx2: no incbin directive"
           * doctest::skip(!util::cpu_supports_avx2()))
 {
   CHECK_FALSE(contains_incbin_directive(
-    FMT("\n    #include <stdio.h>\n    .inc{}bin data.bin\n  ", "")));
+    FMT("\n    #include <stdio.h>\n    .inc{}bin(data)\n  ", "")));
 }
 
 TEST_CASE("check_for_source_code_patterns_avx2: simple incbin"

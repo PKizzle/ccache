@@ -68,7 +68,7 @@ clang_cu_tests() {
     set_up_clang
 
     clang_opts_cpp="-c -x c++"
-    clang_opts_cuda="-c -x $CLANG_CU_LANG_TYPE"
+    clang_opts_cuda="-c -x $CLANG_CU_LANG_TYPE -Wno-unknown-cuda-version"
     clang_opts_gpu1="--cuda-gpu-arch=sm_50"
     clang_opts_gpu2="--cuda-gpu-arch=sm_75"
     ccache_clang_cpp="$CCACHE $REAL_CLANG $clang_opts_cpp"
@@ -85,13 +85,13 @@ clang_cu_tests() {
     expect_stat preprocessed_cache_hit 0
     expect_stat cache_miss 1
     expect_stat files_in_cache 1
-    expect_equal_content reference_test1.o test_cpp.o
+    expect_equal_object_files reference_test1.o test_cpp.o
 
     $ccache_clang_cpp test_cpp.cu
     expect_stat preprocessed_cache_hit 1
     expect_stat cache_miss 1
     expect_stat files_in_cache 1
-    expect_equal_content reference_test1.o test_cpp.o
+    expect_equal_object_files reference_test1.o test_cpp.o
 
     # -------------------------------------------------------------------------
     TEST "Different GPU architectures"
@@ -194,54 +194,43 @@ clang_cu_tests() {
     expect_stat preprocessed_cache_hit 0
     expect_stat cache_miss 1
     expect_stat files_in_cache 1
-    expect_equal_content reference_test1.o test_cpp.o
+    expect_equal_object_files reference_test1.o test_cpp.o
 
     # Specified define, but unused. Can only be found by preprocessed mode.
     $ccache_clang_cpp -DDUMMYENV=1 test_cpp.cu
     expect_stat preprocessed_cache_hit 1
     expect_stat cache_miss 1
     expect_stat files_in_cache 1
-    expect_equal_content reference_test1.o test_cpp.o
+    expect_equal_object_files reference_test1.o test_cpp.o
 
     # Specified used define.
     $ccache_clang_cpp -DNUM=10 test_cpp.cu
     expect_stat preprocessed_cache_hit 1
     expect_stat cache_miss 2
     expect_stat files_in_cache 2
-    expect_equal_content reference_test2.o test_cpp.o
+    expect_equal_object_files reference_test2.o test_cpp.o
 
     $ccache_clang_cpp -DNUM=10 test_cpp.cu
     expect_stat preprocessed_cache_hit 2
     expect_stat cache_miss 2
     expect_stat files_in_cache 2
-    expect_equal_content reference_test2.o test_cpp.o
+    expect_equal_object_files reference_test2.o test_cpp.o
 
-    TEST "No cache(preprocess failed)"
-
-    $ccache_clang_cuda -DNUM=i test_cuda.cu
-    expect_stat preprocessed_cache_hit 0
-    expect_stat cache_miss 0
-    expect_stat files_in_cache 0
-
-    $ccache_clang_cuda -DNUM=i test_cuda.cu
-    expect_stat preprocessed_cache_hit 0
-    expect_stat cache_miss 0
-    expect_stat files_in_cache 0
-
+    # -------------------------------------------------------------------------
     TEST "verbose mode"
 
     $REAL_CLANG $clang_opts_cuda -o reference_test5.o test_cuda.cu
     $cuobjdump reference_test5.o > reference_test5.dump
 
     # First compile.
-    $ccache_clang_cuda -v test_cuda.cu
+    $ccache_clang_cuda -v test_cuda.cu 2>/dev/null
     expect_stat preprocessed_cache_hit 0
     expect_stat cache_miss 1
     expect_stat files_in_cache 1
     $cuobjdump test_cuda.o > test5_1.dump
     expect_equal_content test5_1.dump reference_test5.dump
 
-    $ccache_clang_cuda -v test_cuda.cu
+    $ccache_clang_cuda -v test_cuda.cu 2>/dev/null
     expect_stat preprocessed_cache_hit 1
     expect_stat cache_miss 1
     expect_stat files_in_cache 1

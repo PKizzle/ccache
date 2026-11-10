@@ -106,7 +106,8 @@ TEST_CASE("Serializer accepts the maximum uint8_t number of file entries")
   }
 
   util::Bytes bytes;
-  serializer.serialize(bytes);
+  serializer.serialize(
+    [&](auto chunk) { bytes.insert(bytes.end(), chunk); });
 
   CountingVisitor visitor;
   Deserializer(bytes).visit(visitor);
@@ -128,7 +129,9 @@ TEST_CASE("Serializer rejects more than the uint8_t number of file entries")
   }
 
   util::Bytes bytes;
-  CHECK_THROWS_AS(serializer.serialize(bytes), core::Error);
+  CHECK_THROWS_AS(serializer.serialize(
+                    [&](auto chunk) { bytes.insert(bytes.end(), chunk); }),
+                  core::Error);
 }
 
 TEST_CASE("ResultRetriever writes ISPC multi-target files in entry order")

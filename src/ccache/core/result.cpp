@@ -28,8 +28,8 @@
 #include <ccache/util/bytes.hpp>
 #include <ccache/util/direntry.hpp>
 #include <ccache/util/expected.hpp>
+#include <ccache/util/fd.hpp>
 #include <ccache/util/file.hpp>
-#include <ccache/util/filestream.hpp>
 #include <ccache/util/filesystem.hpp>
 #include <ccache/util/format.hpp>
 #include <ccache/util/logging.hpp>
@@ -296,7 +296,7 @@ Serializer::serialized_size() const
 }
 
 void
-Serializer::serialize(util::Bytes& output)
+Serializer::serialize(const util::DataReceiver& receiver)
 {
   const auto max_file_entries = std::numeric_limits<uint8_t>::max();
   if (m_file_entries.size() > max_file_entries) {
@@ -305,7 +305,7 @@ Serializer::serialize(util::Bytes& output)
                     max_file_entries));
   }
 
-  CacheEntryDataWriter writer(output);
+  CacheEntryDataWriter writer(receiver);
 
   writer.write_int(k_format_version);
   writer.write_int(static_cast<uint8_t>(m_file_entries.size()));
@@ -339,9 +339,25 @@ Serializer::serialize(util::Bytes& output)
         RawFile{file_number, std::get<std::string>(entry.data)});
     } else if (is_file_entry) {
       const auto& path = std::get<std::string>(entry.data);
-      const auto data = util::value_or_throw<Error>(
-        util::read_file<util::Bytes>(path), FMT("Failed to read {}: ", path));
-      writer.write_bytes(data);
+      util::Fd fd(open(path.c_str(), O_RDONLY | O_BINARY));
+      if (!fd) {
+        throw Error(FMT("Failed to open {}: {}", path, strerror(errno)));
+      }
+      uint64_t bytes_read = 0;
+      util::throw_on_error<Error>(
+        util::read_fd(*fd,
+                      [&](auto data) {
+                        if (data.size() > file_size - bytes_read) {
+                          throw Error(
+                            FMT("File size changed while reading {}", path));
+                        }
+                        writer.write_bytes(data);
+                        bytes_read += data.size();
+                      }),
+        FMT("Failed to read {}: ", path));
+      if (bytes_read != file_size) {
+        throw Error(FMT("File size changed while reading {}", path));
+      }
     } else {
       writer.write_bytes(std::get<std::span<const uint8_t>>(entry.data));
     }

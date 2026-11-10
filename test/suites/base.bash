@@ -78,17 +78,28 @@ base_tests() {
     # -------------------------------------------------------------------------
     TEST "Debug option"
 
-    $CCACHE_COMPILE -c test1.c -g
+    # Clang's CodeView debug information records the compiler command line,
+    # which differs from a direct compilation since ccache adds
+    # -fcolor-diagnostics.
+    debug_flags=-g
+    if $COMPILER_TYPE_CLANG && $COMPILER_USES_MSVC; then
+        debug_flags="-g -gno-codeview-command-line"
+    fi
+
+    $CCACHE_COMPILE -c test1.c $debug_flags
     expect_stat preprocessed_cache_hit 0
     expect_stat cache_miss 1
     expect_stat files_in_cache 1
 
-    $CCACHE_COMPILE -c test1.c -g
+    $CCACHE_COMPILE -c test1.c $debug_flags
     expect_stat preprocessed_cache_hit 1
     expect_stat cache_miss 1
 
-    $COMPILER -c -o reference_test1.o test1.c -g
-    expect_equal_object_files reference_test1.o test1.o
+    # The debug information can record the path of the object file (e.g.
+    # CodeView's S_OBJNAME), so compile the reference object to the same path.
+    mv test1.o ccache_test1.o
+    $COMPILER -c test1.c $debug_flags
+    expect_equal_object_files ccache_test1.o test1.o
 
     # -------------------------------------------------------------------------
     TEST "Output option"
@@ -592,7 +603,7 @@ fi
     # -------------------------------------------------------------------------
     TEST "Directory is not hashed if using -gz"
 
-    if $COMPILER -c test1.c -gz 2>/dev/null \
+    if $COMPILER -Werror -c test1.c -gz 2>/dev/null \
        && $COMPILER -E test1.c -gz >preprocessed.i 2>/dev/null \
        && [ -s preprocessed.i ] \
        && ! grep -Fq $PWD preprocessed.i; then
@@ -765,7 +776,7 @@ b"
     expect_stat preprocessed_cache_hit 0
     expect_stat cache_miss 1
 
-    $COMPILER -c test1.c -E >test1.i
+    $COMPILER test1.c -E >test1.i
     $CCACHE_COMPILE -c test1.i
     expect_stat preprocessed_cache_hit 0
     expect_stat cache_miss 2
@@ -1360,6 +1371,36 @@ fi
     fi
 
     # -------------------------------------------------------------------------
+if ! $HOST_OS_WINDOWS; then
+    TEST "Closed stderr pipe with SIGPIPE ignored"
+
+    echo 'int main(void) { return undefined_symbol; }' >invalid.c
+    (
+        ulimit -c 0
+        trap '' PIPE
+        # Keep the reader alive until open completes so SIGCHLD cannot interrupt it.
+        mkfifo closed-stderr.fifo
+        read -r <closed-stderr.fifo &
+        reader_pid=$!
+        exec 3>closed-stderr.fifo
+        echo >&3
+        wait "$reader_pid"
+        rm closed-stderr.fifo
+        $CCACHE_COMPILE -c invalid.c >&3 2>&1
+    )
+    expect_equal "$?" 1
+
+    $CCACHE_COMPILE -c invalid.c 2>stderr.txt
+    expect_equal "$?" 1
+    expect_contains stderr.txt undefined_symbol
+
+    $CCACHE missing-compiler -c invalid.c 2>stderr.txt
+    expect_equal "$?" 1
+    echo 'ccache: error: Could not find compiler "missing-compiler" in PATH' >expected.txt
+    expect_equal_content expected.txt stderr.txt
+fi
+
+    # -------------------------------------------------------------------------
     TEST "Caching stderr"
 
     cat <<EOF >stderr.c
@@ -1424,7 +1465,7 @@ EOF
     $CCACHE_COMPILE -Wall -c hello.c 2>stderr_1.txt
     expect_equal_text_content stderr_1_ref.txt stderr_1.txt
 
-    sed -i 's/comment/comment\n/' hello.h
+    perl -pi -e 's/comment/comment\n/' hello.h
 
     $COMPILER -c -Wall -c hello.c 2>stderr_2_ref.txt
     $CCACHE_COMPILE -Wall -c hello.c 2>stderr_2.txt
@@ -1734,7 +1775,10 @@ EOF
     expect_stat cache_miss 2
 
     # -------------------------------------------------------------------------
-    if $COMPILER -march=native -c test1.c 2>/dev/null; then
+    # Some compilers warn about the features that -march=native detects, e.g.
+    # Clang 18 on CPUs with AVX10, which the test would take as a failure. A
+    # compiler without -march=native fails with an error message.
+    if [ -z "$($COMPILER -march=native -c test1.c 2>&1)" ]; then
         TEST "-march=native, no CWD in input hash"
         CCACHE_DEBUG=1 $CCACHE_COMPILE -march=native -c test1.c
         expect_not_contains test1.o.*.ccache-input-text "$PWD"
@@ -1919,6 +1963,8 @@ EOF
     # -------------------------------------------------------------------------
     TEST ".incbin in .s"
 
+    touch empty.bin
+
     cat <<EOF >incbin.s
 .incbin "empty.bin";
 EOF
@@ -1991,6 +2037,24 @@ EOF
     $CCACHE_COMPILE -c incbin.c
     expect_stat preprocessed_cache_hit 0
     expect_stat cache_miss 0
+    expect_stat unsupported_code_directive 1
+
+    # -------------------------------------------------------------------------
+    TEST ".incbin with macro operand in .S, direct mode"
+
+    unset CCACHE_NODIRECT
+
+    touch empty.bin
+
+    cat <<EOF >incbin.S
+        .incbin EMPTY_BIN
+EOF
+
+    $CCACHE_COMPILE -c -o incbin.o -DEMPTY_BIN='"empty.bin"' incbin.S
+
+    expect_stat cache_miss 0
+    expect_stat direct_cache_hit 0
+    expect_stat preprocessed_cache_hit 0
     expect_stat unsupported_code_directive 1
 
     # -------------------------------------------------------------------------

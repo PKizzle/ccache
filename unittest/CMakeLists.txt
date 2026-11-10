@@ -9,6 +9,7 @@ set(
   test_compression_types.cpp
   test_config.cpp
   test_core_atomicfile.cpp
+  test_core_cacheentry.cpp
   test_core_common.cpp
   test_core_result.cpp
   test_core_statistics.cpp
@@ -43,6 +44,10 @@ set(
 
 if(INODE_CACHE_SUPPORTED)
   list(APPEND source_files test_inodecache.cpp)
+endif()
+
+if(NOT WIN32)
+  list(APPEND source_files test_storage_remote_helper.cpp)
 endif()
 
 if(WIN32)

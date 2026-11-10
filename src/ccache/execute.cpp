@@ -77,7 +77,8 @@ static std::optional<int>
 win32execute(const char* const* argv,
              int fd_stdout,
              int fd_stderr,
-             const fs::path& temp_dir)
+             const fs::path& temp_dir,
+             util::Args::ResponseFileFormat response_file_format)
 {
   LOG("Executing {}", util::format_argv_for_logging(argv));
 
@@ -190,7 +191,8 @@ win32execute(const char* const* argv,
     auto tmp_file = util::value_or_throw<core::Fatal>(
       util::TemporaryFile::create(FMT("{}/cmd_args", temp_dir)));
     LOG("Arguments from {}", tmp_file.path);
-    commandline = util::format_argv_as_win32_command_string(argv + 1, true);
+    commandline =
+      util::Args::format_response_file_content(argv + 1, response_file_format);
     if (auto r = util::write_fd(
           *tmp_file.fd, commandline.data(), commandline.length());
         !r) {
@@ -249,9 +251,11 @@ win32execute(const char* const* argv,
 }
 
 void
-execute_noreturn(const char* const* argv, const fs::path& temp_dir)
+execute_noreturn(const char* const* argv,
+                 const fs::path& temp_dir,
+                 util::Args::ResponseFileFormat response_file_format)
 {
-  auto exit_code = win32execute(argv, -1, -1, temp_dir);
+  auto exit_code = win32execute(argv, -1, -1, temp_dir, response_file_format);
   if (exit_code) {
     exit(*exit_code);
   }
@@ -263,8 +267,11 @@ execute(Context& ctx,
         util::Fd&& fd_out,
         util::Fd&& fd_err)
 {
-  return win32execute(
-           argv, fd_out.release(), fd_err.release(), ctx.config.temporary_dir())
+  return win32execute(argv,
+                      fd_out.release(),
+                      fd_err.release(),
+                      ctx.config.temporary_dir(),
+                      ctx.config.response_file_format())
     .value_or(-1);
 }
 
@@ -303,20 +310,20 @@ execute(Context& ctx,
 
   posix_spawnattr_t attr;
   CHECK_LIB_CALL(posix_spawnattr_init, &attr);
-  CHECK_LIB_CALL(posix_spawnattr_setflags,
-                 &attr,
-                 POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK);
 
-  sigset_t sigmask;
-  CHECK_LIB_CALL(sigemptyset, &sigmask);
-  CHECK_LIB_CALL(posix_spawnattr_setsigmask, &attr, &sigmask);
+  if (SignalHandler::is_active()) {
+    CHECK_LIB_CALL(posix_spawnattr_setflags,
+                   &attr,
+                   POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK);
 
-  sigset_t sigdefault;
-  CHECK_LIB_CALL(sigemptyset, &sigdefault);
-  for (int signum : SignalHandler::get_handled_signals()) {
-    CHECK_LIB_CALL(sigaddset, &sigdefault, signum);
+    sigset_t sigmask;
+    CHECK_LIB_CALL(sigprocmask, SIG_BLOCK, nullptr, &sigmask);
+    CHECK_LIB_CALL(posix_spawnattr_setsigmask, &attr, &sigmask);
+
+    CHECK_LIB_CALL(posix_spawnattr_setsigdefault,
+                   &attr,
+                   &SignalHandler::get_signals_to_reset());
   }
-  CHECK_LIB_CALL(posix_spawnattr_setsigdefault, &attr, &sigdefault);
 
   int result;
   {
@@ -358,7 +365,9 @@ execute(Context& ctx,
 }
 
 void
-execute_noreturn(const char* const* argv, const fs::path& /*temp_dir*/)
+execute_noreturn(const char* const* argv,
+                 const fs::path& /*temp_dir*/,
+                 util::Args::ResponseFileFormat /*response_file_format*/)
 {
   LOG("Executing {}", util::format_argv_for_logging(argv));
 

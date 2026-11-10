@@ -86,7 +86,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <exception>
 #include <initializer_list>
+#include <memory>
 #include <span>
 #include <tuple>
 #include <unordered_map>
@@ -444,12 +446,13 @@ remember_include_file(Context& ctx,
   }
 
   if (!ctx.ignore_header_paths.empty()) {
-    // Canonicalize path for comparison; Clang uses ./header.h.
-    const std::string& canonical_path_str =
-      path_str.str().starts_with("./") ? path_str.str().substr(2) : path_str;
+    // Canonicalize path for comparison; Clang uses ./header.h, or .\header.h on
+    // Windows.
+    const fs::path canonical_path =
+      *path.begin() == "." ? path.lexically_relative(".") : path;
     for (const auto& ignore_header_path : ctx.ignore_header_paths) {
       if (file_path_matches_dir_prefix_or_file(ignore_header_path,
-                                               canonical_path_str)) {
+                                               canonical_path)) {
         return {};
       }
     }
@@ -1928,6 +1931,32 @@ hash_common_info(const Context& ctx, const util::Args& args, Hash& hash)
       }
     }
   }
+
+  // Also hash the triple that clang-cl and icx embed in precompiled headers
+  // since the variables above are unset when the compiler finds Visual Studio
+  // on its own and don't change when cl.exe is updated in place.
+  if ((ctx.config.compiler_type() == CompilerType::clang_cl
+       || ctx.config.compiler_type() == CompilerType::icx_cl
+       || ctx.config.compiler_type() == CompilerType::icx)
+      && ctx.args_info.generating_pch) {
+    util::Args probe_args = ctx.orig_args;
+    probe_args[0] = compiler_path.string();
+    probe_args.insert(1, {"-###"}); // insert before any "--" terminator
+
+    const auto output = util::exec_to_string(probe_args);
+    if (!output) {
+      LOG("Failure running {} -###: {}", compiler_path, output.error());
+      return tl::unexpected(Statistic::compiler_check_failed);
+    }
+    const std::string_view triple = find_clang_cc1_triple(*output);
+    if (triple.empty()) {
+      LOG("No target triple in {} -### output", compiler_path);
+      return tl::unexpected(Statistic::compiler_check_failed);
+    }
+    LOG("Target triple: {}", triple);
+    hash.hash_delimiter("target triple");
+    hash.hash(triple);
+  }
 #endif
 
   if (!(ctx.config.sloppiness().contains(core::Sloppy::locale))) {
@@ -3057,6 +3086,7 @@ cache_compilation(int argc, const char* const* argv)
   util::Args saved_orig_args;
   std::optional<uint32_t> original_umask;
   fs::path saved_temp_dir;
+  auto saved_response_file_format = util::Args::ResponseFileFormat::auto_guess;
 
   auto argv_parts = split_argv(argc, argv);
   if (argv_parts.compiler_and_args.empty()) {
@@ -3081,7 +3111,10 @@ cache_compilation(int argc, const char* const* argv)
     Context ctx(ccache_exe_dir);
     ctx.initialize(std::move(argv_parts.compiler_and_args),
                    argv_parts.config_settings);
-    SignalHandler signal_handler(ctx);
+    // The signal handler stores its address globally, so allocate it on the
+    // heap to avoid warnings from static code analyzers that don't understand
+    // the object lifetime properly.
+    auto signal_handler = std::make_unique<SignalHandler>(ctx);
     DEFER(finalize_at_exit(ctx));
 
     initialize(ctx, argv, argv_parts.masquerading_as_compiler);
@@ -3123,6 +3156,7 @@ cache_compilation(int argc, const char* const* argv)
       LOG("Failed; falling back to running the real compiler");
 
       saved_temp_dir = ctx.config.temporary_dir();
+      saved_response_file_format = ctx.config.response_file_format();
       saved_orig_args = std::move(ctx.orig_args);
       auto execv_argv = saved_orig_args.to_argv();
       LOG("Executing {}", util::format_argv_for_logging(execv_argv.data()));
@@ -3136,7 +3170,8 @@ cache_compilation(int argc, const char* const* argv)
       util::set_umask(*original_umask);
     }
     auto execv_argv = saved_orig_args.to_argv();
-    execute_noreturn(execv_argv.data(), saved_temp_dir);
+    execute_noreturn(
+      execv_argv.data(), saved_temp_dir, saved_response_file_format);
     throw core::Fatal(
       FMT("execute_noreturn of {} failed: {}", execv_argv[0], strerror(errno)));
   }
@@ -3193,6 +3228,16 @@ do_cache_compilation(Context& ctx)
            || ctx.args_info.generating_includes)) {
     LOG("Disabling depend mode");
     ctx.config.set_depend_mode(false);
+  }
+
+  if (ctx.config.depend_mode() && ctx.config.is_compiler_group_gcc()
+      && ctx.args_info.using_precompiled_header
+      && ctx.args_info.included_pch_file.empty()
+      && !ctx.args_info.output_is_precompiled_header) {
+    // GCC may omit the PCH and its headers from the dependency file. Without
+    // the PCH path, depend mode cannot track all compilation inputs.
+    LOG("Cannot use depend mode without the precompiled header path");
+    return tl::unexpected(Statistic::could_not_use_precompiled_header);
   }
 
   if (!ctx.config.remote_storage().empty()) {
@@ -3449,7 +3494,11 @@ ccache_main(int argc, const char* const* argv)
 
     return cache_compilation(argc, argv);
   } catch (const core::ErrorBase& e) {
-    PRINT(stderr, "ccache: error: {}\n", e.what());
+    try {
+      PRINT(stderr, "ccache: error: {}\n", e.what());
+    } catch (const std::exception&) {
+      // Error reporting must not throw if stderr is no longer writable.
+    }
     return EXIT_FAILURE;
   }
 }

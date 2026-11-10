@@ -167,9 +167,9 @@ check_for_incbin_directive(std::string_view str, size_t pos)
   const char* p = begin + pos + incbin_size;
   p = skip_horizontal_whitespace(p, end);
 
-  return p < end && (*p == '"' || (*p == '\\' && p + 1 < end && p[1] == '"'))
-           ? SourceCodeScan::found_incbin
-           : SourceCodeScan::none;
+  // If followed by left parenthesis it's a method call.
+  return p < end && *p == '(' ? SourceCodeScan::none
+                              : SourceCodeScan::found_incbin;
 }
 
 void
@@ -228,21 +228,26 @@ do_hash_file(const Context& ctx,
   (void)ctx;
 #endif
 
-  const auto data = util::read_file<util::Bytes>(path, size_hint);
-  if (!data) {
-    LOG("Failed to read {}: {}", path, data.error());
-    return std::nullopt;
-  }
-
-  auto str = util::to_string_view(*data);
   Hash hash;
-  hash.hash(str);
-  digest = hash.digest();
-
   SourceCodeScanResult result;
   if (scan_source) {
+    const auto data = util::read_file<util::Bytes>(path, size_hint);
+    if (!data) {
+      LOG("Failed to read {}: {}", path, data.error());
+      return std::nullopt;
+    }
+    const auto str = util::to_string_view(*data);
+    hash.hash(str);
     result = check_for_source_code_patterns(str);
+  } else {
+    const auto hash_result = hash.hash_file(path);
+    if (!hash_result) {
+      LOG("Failed to read {}: {}", path, hash_result.error());
+      return std::nullopt;
+    }
   }
+  digest = hash.digest();
+
 #ifdef INODE_CACHE_SUPPORTED
   ctx.inode_cache.put(path, content_type, digest, result);
 #endif
@@ -541,4 +546,20 @@ find_incbin_directive(std::string_view str, size_t start)
     }
   }
   return std::string_view::npos;
+}
+
+std::string_view
+find_clang_cc1_triple(std::string_view driver_output)
+{
+  constexpr std::string_view marker = R"("-triple" ")";
+  const size_t marker_pos = driver_output.find(marker);
+  if (marker_pos == std::string_view::npos) {
+    return {};
+  }
+  const size_t start = marker_pos + marker.size();
+  const size_t end = driver_output.find('"', start);
+  if (end == std::string_view::npos) {
+    return {};
+  }
+  return driver_output.substr(start, end - start);
 }

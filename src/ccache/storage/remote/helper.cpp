@@ -20,10 +20,11 @@
 
 #include <ccache/config.hpp>
 #include <ccache/core/exceptions.hpp>
+#include <ccache/execute.hpp>
 #include <ccache/hash.hpp>
 #include <ccache/storage/remote/client.hpp>
+#include <ccache/storage/storage.hpp>
 #include <ccache/util/defer.hpp>
-#include <ccache/util/direntry.hpp>
 #include <ccache/util/environment.hpp>
 #include <ccache/util/error.hpp>
 #include <ccache/util/format.hpp>
@@ -100,57 +101,6 @@ generate_endpoint_name(
   }
   return FMT("storage-{}-{}", url.scheme(), util::format_base16(hash.digest()));
 }
-
-#ifndef _WIN32
-// Choose a short and safe base directory for Unix socket.
-//
-// Rationale:
-// - Unix socket paths have a strict length limit (sun_path).
-// - The ccache configured temporary dir can become very long (e.g. in CI).
-// - We want a directory that is private to the user to avoid other users
-//   squatting the socket name.
-std::optional<fs::path>
-get_helper_ipc_dir()
-{
-  // If XDG_RUNTIME_DIR is set, use the same location as
-  // Config::default_temporary_dir.
-  if (const auto dir = Config::get_xdg_runtime_tmp_dir(); !dir.empty()) {
-    return dir;
-  }
-
-  // Otherwise, create a per-user private directory under /tmp. We intentionally
-  // use /tmp instead of $TMPDIR to keep socket paths short.
-  fs::path dir = FMT("/tmp/ccache-tmp-{}", static_cast<uint64_t>(getuid()));
-  if (auto r = fs::create_directories(dir); !r) {
-    LOG("Failed to create helper IPC dir {}: {}", dir, r.error());
-    return std::nullopt;
-  }
-
-  // Ensure correct permissions regardless of umask.
-  if (chmod(dir.c_str(), 0700) != 0) {
-    LOG("Failed to chmod helper IPC dir {}: {}", dir, strerror(errno));
-    return std::nullopt;
-  }
-
-  util::DirEntry entry(dir);
-  if (!entry) {
-    LOG("Failed to stat helper IPC dir {}: {}",
-        dir,
-        strerror(entry.error_number()));
-    return std::nullopt;
-  }
-  if (!entry.is_directory() || entry.is_symlink()) {
-    LOG("Helper IPC dir {} is not a directory", dir);
-    return std::nullopt;
-  }
-  if ((entry.mode() & 0077) != 0) {
-    LOG("Helper IPC dir {} is not private (mode {:o})", dir, entry.mode());
-    return std::nullopt;
-  }
-
-  return dir;
-}
-#endif
 
 std::vector<std::string>
 build_helper_env(
@@ -236,6 +186,30 @@ get_fds_to_close()
   return fds_to_close;
 }
 #endif
+
+fs::path
+find_helper(std::string_view name, const std::vector<fs::path>& search_dirs)
+{
+  const bool bare_helper_name =
+#ifdef _WIN32
+    name.find('\\') == std::string::npos &&
+#endif
+    name.find('/') == std::string::npos;
+  fs::path path = bare_helper_name ? find_executable_in_path(name, search_dirs)
+#ifdef _WIN32
+                                   : util::add_exe_suffix(name);
+#else
+                                   : name;
+#endif
+
+  if (!path.empty() && fs::exists(path)) {
+    LOG("Found remote storage helper {}", path);
+    return path;
+  }
+
+  LOG("Could not find remote storage helper program \"{}\"", name);
+  return {};
+}
 
 tl::expected<void, std::string>
 spawn_helper(const fs::path& helper_path,
@@ -361,17 +335,23 @@ spawn_helper(const fs::path& helper_path,
   return {};
 }
 
+struct HelperTimeouts
+{
+  std::chrono::milliseconds data;
+  std::chrono::milliseconds request;
+  std::chrono::milliseconds idle;
+};
+
 // Backend implementation that communicates with a helper process.
 class HelperBackend : public RemoteStorage::Backend
 {
 public:
-  HelperBackend(const fs::path& helper_path,
+  HelperBackend(const std::string& helper_name,
+                const std::vector<fs::path>& helper_search_dirs,
                 const fs::path& temp_dir,
                 const Url& url,
                 const std::vector<Backend::Attribute>& attributes,
-                std::chrono::milliseconds data_timeout,
-                std::chrono::milliseconds request_timeout,
-                std::chrono::milliseconds idle_timeout);
+                HelperTimeouts timeouts);
 
   tl::expected<std::optional<util::Bytes>, Failure>
   get(const Hash::Digest& key) override;
@@ -385,7 +365,8 @@ public:
   void stop() override;
 
 private:
-  fs::path m_helper_path;
+  std::string m_helper_name;
+  std::vector<fs::path> m_helper_search_dirs;
   std::string m_endpoint;        // Unix socket on POSIX, pipe name on Windows
   fs::path m_endpoint_lock_path; // path to lock for guarding spawn of helper
   Url m_url;
@@ -399,21 +380,21 @@ private:
   tl::expected<void, Failure> finalize_connection();
 };
 
-HelperBackend::HelperBackend(const fs::path& helper_path,
+HelperBackend::HelperBackend(const std::string& helper_name,
+                             const std::vector<fs::path>& helper_search_dirs,
                              const fs::path& temp_dir,
                              const Url& url,
                              const std::vector<Backend::Attribute>& attributes,
-                             std::chrono::milliseconds data_timeout,
-                             std::chrono::milliseconds request_timeout,
-                             std::chrono::milliseconds idle_timeout)
-  : m_helper_path(helper_path),
+                             HelperTimeouts timeouts)
+  : m_helper_name(helper_name),
+    m_helper_search_dirs(helper_search_dirs),
     m_url(url),
     m_attributes(attributes),
-    m_data_timeout(data_timeout),
-    m_idle_timeout(idle_timeout),
-    m_client(data_timeout, request_timeout)
+    m_data_timeout(timeouts.data),
+    m_idle_timeout(timeouts.idle),
+    m_client(timeouts.data, timeouts.request)
 {
-  if (m_helper_path.empty()) {
+  if (m_helper_name.empty()) {
     // The "crsh:" URL case:
 #ifdef _WIN32
     m_endpoint = FMT("{}{}", k_named_pipe_prefix, url.path());
@@ -428,7 +409,8 @@ HelperBackend::HelperBackend(const fs::path& helper_path,
     m_endpoint = FMT("{}ccache-{}", k_named_pipe_prefix, endpoint_name);
     m_endpoint_lock_path = FMT("{}/{}", temp_dir, endpoint_name);
 #else
-    auto helper_ipc_dir = get_helper_ipc_dir();
+    // We intentionally use /tmp instead of $TMPDIR to keep socket paths short.
+    auto helper_ipc_dir = get_helper_ipc_dir("/tmp");
     if (!helper_ipc_dir) {
       LOG("Failed to select helper IPC dir, falling back to {}", temp_dir);
       helper_ipc_dir = temp_dir;
@@ -502,8 +484,13 @@ HelperBackend::ensure_connected(bool spawn)
     return {};
   }
 
-  if (m_helper_path.empty()) {
+  if (m_helper_name.empty()) {
     // Could not connect to "crsh:" endpoint, so just fail.
+    return tl::unexpected(Failure::error);
+  }
+
+  const auto helper_path = find_helper(m_helper_name, m_helper_search_dirs);
+  if (helper_path.empty()) {
     return tl::unexpected(Failure::error);
   }
 
@@ -535,8 +522,8 @@ HelperBackend::ensure_connected(bool spawn)
 
   // No helper exists, spawn it now.
   timer.reset();
-  auto spawn_result = spawn_helper(
-    m_helper_path, m_endpoint, m_url, m_idle_timeout, m_attributes);
+  auto spawn_result =
+    spawn_helper(helper_path, m_endpoint, m_url, m_idle_timeout, m_attributes);
   if (!spawn_result) {
     LOG("Failed to spawn helper: {}", spawn_result.error());
     return tl::unexpected(Failure::error);
@@ -662,27 +649,91 @@ HelperBackend::stop()
     LOG("Failed to connect to remote storage helper");
     return;
   }
+  const auto url_for_logging = get_redacted_url_str_for_logging(m_url);
   if (!m_connected) {
-    LOG("No need to stop remote storage helper for {}", m_url.str());
+    LOG("No need to stop remote storage helper for {}", url_for_logging);
     return;
   }
   if (auto r = m_client.stop(); r) {
-    LOG("Stopped remote storage helper for {}", m_url.str());
+    LOG("Stopped remote storage helper for {}", url_for_logging);
   } else {
     LOG("Failed to stop remote storage helper for {}: {}",
-        m_url.str(),
+        url_for_logging,
         r.error().message);
   }
 }
 
 } // namespace
 
-Helper::Helper(const std::filesystem::path& helper_path,
+#ifndef _WIN32
+// Choose a short and safe base directory for Unix socket.
+//
+// Rationale:
+// - Unix socket paths have a strict length limit (sun_path).
+// - The ccache configured temporary dir can become very long (e.g. in CI).
+// - We want a directory that is private to the user to avoid other users
+//   squatting the socket name.
+std::optional<fs::path>
+get_helper_ipc_dir(const fs::path& tmp_dir)
+{
+  // If XDG_RUNTIME_DIR is set, use the same location as
+  // Config::default_temporary_dir.
+  if (const auto dir = Config::get_xdg_runtime_tmp_dir(); !dir.empty()) {
+    return dir;
+  }
+
+#  if !defined(O_DIRECTORY) || !defined(O_NOFOLLOW)
+  LOG(
+    "Cannot securely create helper IPC dir in {}: O_DIRECTORY or O_NOFOLLOW is"
+    " unavailable",
+    tmp_dir);
+  return std::nullopt;
+#  else
+  // Otherwise, create a private per-user directory in tmp_dir.
+  const fs::path dir =
+    tmp_dir / FMT("ccache-tmp-{}", static_cast<uint64_t>(getuid()));
+  if (mkdir(dir.c_str(), 0700) != 0 && errno != EEXIST) {
+    LOG("Failed to create helper IPC dir {}: {}", dir, strerror(errno));
+    return std::nullopt;
+  }
+
+  const int fd = open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+  if (fd < 0) {
+    LOG("Failed to open helper IPC dir {}: {}", dir, strerror(errno));
+    return std::nullopt;
+  }
+  DEFER(close(fd));
+
+  struct stat st;
+  if (fstat(fd, &st) != 0) {
+    LOG("Failed to stat helper IPC dir {}: {}", dir, strerror(errno));
+    return std::nullopt;
+  }
+  if (!S_ISDIR(st.st_mode) || st.st_uid != geteuid()) {
+    LOG("Helper IPC dir {} is not owned by the current user or not a directory",
+        dir);
+    return std::nullopt;
+  }
+
+  // Ensure correct permissions regardless of umask.
+  if ((st.st_mode & 07777) != 0700 && fchmod(fd, 0700) != 0) {
+    LOG("Failed to chmod helper IPC dir {}: {}", dir, strerror(errno));
+    return std::nullopt;
+  }
+
+  return dir;
+#  endif
+}
+#endif
+
+Helper::Helper(const std::string& helper_name,
+               const std::vector<std::filesystem::path>& helper_search_dirs,
                const fs::path& temp_dir,
                std::chrono::milliseconds data_timeout,
                std::chrono::milliseconds request_timeout,
                std::chrono::milliseconds idle_timeout)
-  : m_helper_path(helper_path),
+  : m_helper_name(helper_name),
+    m_helper_search_dirs(helper_search_dirs),
     m_temp_dir(temp_dir),
     m_data_timeout(data_timeout),
     m_request_timeout(request_timeout),
@@ -701,13 +752,13 @@ std::unique_ptr<RemoteStorage::Backend>
 Helper::create_backend(const Url& url,
                        const std::vector<Backend::Attribute>& attributes) const
 {
-  return std::make_unique<HelperBackend>(m_helper_path,
-                                         m_temp_dir,
-                                         url,
-                                         attributes,
-                                         m_data_timeout,
-                                         m_request_timeout,
-                                         m_idle_timeout);
+  return std::make_unique<HelperBackend>(
+    m_helper_name,
+    m_helper_search_dirs,
+    m_temp_dir,
+    url,
+    attributes,
+    HelperTimeouts{m_data_timeout, m_request_timeout, m_idle_timeout});
 }
 
 } // namespace storage::remote

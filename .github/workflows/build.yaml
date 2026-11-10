@@ -8,6 +8,10 @@ on:
         description: 'Optional tag name to simulate release'
         required: false
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.run_id || github.ref }}
+  cancel-in-progress: true
+
 env:
   CTEST_OUTPUT_ON_FAILURE: ON
   VERBOSE: 1
@@ -23,6 +27,7 @@ jobs:
   build_and_test:
     timeout-minutes: 30
     env:
+      CCACHE_KEY: ${{ matrix.os }}-${{ matrix.compiler }}-${{ matrix.version }}
       CMAKE_GENERATOR: Ninja
 
     name: ${{ matrix.os }}-${{ matrix.compiler }}-${{ matrix.version }}
@@ -67,10 +72,6 @@ jobs:
             compiler: gcc
             version: "13"
 
-          - os: macOS-14
-            compiler: xcode
-            version: "15.4"
-
           - os: macOS-15
             compiler: xcode
             version: "16.4"
@@ -88,11 +89,8 @@ jobs:
           cmake_params=(-D CMAKE_BUILD_TYPE=CI)
           packages=(
             elfutils
-            libhiredis-dev
             libzstd-dev
             python3
-            redis-server
-            redis-tools
           )
           # Install ld.gold (binutils) and ld.lld (lld) on different runs.
           if [ "${{ matrix.os }}" = "ubuntu-22.04" ]; then
@@ -138,9 +136,6 @@ jobs:
       - name: Install dependencies on macOS
         if: runner.os == 'macOS'
         run: |
-          HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 \
-            brew install hiredis redis
-
           if [ "${{ matrix.compiler }}" = "gcc" ]; then
             brew install gcc@${{ matrix.version }}
             echo "CC=gcc-${{ matrix.version }}" >> $GITHUB_ENV
@@ -154,8 +149,39 @@ jobs:
       - name: Get source
         uses: actions/checkout@v6
 
+      - &set-up-ccache
+        name: Set up ccache
+        id: ccache
+        uses: ./.github/actions/set-up-ccache
+        with:
+          key: ${{ env.CCACHE_KEY || github.job }}
+
       - name: Build and test
+        env:
+          CMAKE_C_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.executable }}
+          CMAKE_CXX_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.executable }}
         run: ci/build
+
+      - &show-ccache-statistics
+        name: Show ccache statistics
+        shell: bash
+        if: ${{ always() && steps.ccache.outcome == 'success' }}
+        env:
+          CCACHE: ${{ steps.ccache.outputs.executable }}
+        run: |
+          {
+            printf '<details>\n<summary>Ccache statistics</summary>\n\n```text\n'
+            "$CCACHE" --show-stats --verbose
+            printf '```\n\n</details>\n'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - &save-compilation-cache
+        name: Save compilation cache
+        if: ${{ success() && steps.ccache.outcome == 'success' && github.ref_type == 'branch' && github.event_name != 'pull_request' && github.event_name != 'pull_request_target' }}
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ runner.temp }}/ccache-cache
+          key: ${{ steps.ccache.outputs.cache-key }}
 
       - name: Collect testdir from failed tests
         if: failure()
@@ -169,17 +195,19 @@ jobs:
           path: testdir.tar.xz
 
   build_and_test_msys:
+    env:
+      CCACHE_KEY: msys-${{ matrix.os }}-${{ matrix.sys }}-${{ matrix.compiler }}
     timeout-minutes: 30
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - sys: mingw64
+          - sys: ucrt64
             compiler: gcc
             os: windows-2025
 
-          - sys: mingw64
+          - sys: ucrt64
             compiler: clang
             extra_cmake_params: -DCMAKE_CXX_FLAGS=-Wno-deprecated # doctest issue #900
             os: windows-2025
@@ -207,7 +235,6 @@ jobs:
             toolchain:p
             cmake:p
             ninja:p
-            hiredis:p
             lld:p
             ${{matrix.compiler}}:p
 
@@ -227,13 +254,36 @@ jobs:
       - name: Get source
         uses: actions/checkout@v6
 
+      - *set-up-ccache
+
       - name: Build and test
-        run: ci/build
+        id: build-and-test
+        run: |
+          if [ "$MSYSTEM" = UCRT64 ]; then
+            vswhere='/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe'
+            dumpbin=$("$vswhere" -latest -products '*' \
+              -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 \
+              -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe' \
+              | sed -n '1{s/\r$//;p;}')
+            if [ -z "$dumpbin" ]; then
+              echo 'dumpbin.exe not found by vswhere' >&2
+              exit 1
+            fi
+            export PATH="$PATH:$(dirname "$(cygpath -u "$dumpbin")")"
+            command -v dumpbin.exe
+          fi
+          ci/build
         continue-on-error: ${{ matrix.allow_test_failures == true &&
           steps.build-and-test.outputs.exit_status == 8 }}
         env:
           CMAKE_GENERATOR: Ninja
+          CMAKE_C_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.executable }}
+          CMAKE_CXX_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.executable }}
           TEST_CC: ${{ matrix.compiler }}
+
+      - *show-ccache-statistics
+
+      - *save-compilation-cache
 
       - name: Collect testdir from failed tests
         if: failure()
@@ -283,13 +333,21 @@ jobs:
           sudo apt-get install -y g++-aarch64-linux-gnu libc6-dev-arm64-cross
       - name: Get source
         uses: actions/checkout@v6
+      - *set-up-ccache
+
       - name: Build binary
         env:
+          CMAKE_C_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.executable }}
+          CMAKE_CXX_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.executable }}
           CMAKE_GENERATOR: Ninja
           CMAKE_PARAMS: |
             -D CMAKE_TOOLCHAIN_FILE=../toolchains/aarch64-linux-gnu.cmake
             -D CMAKE_EXE_LINKER_FLAGS_INIT=-static-libstdc++
         run: ci/build-binary
+      - *show-ccache-statistics
+
+      - *save-compilation-cache
+
       - name: Upload binary
         uses: actions/upload-artifact@v7
         with:
@@ -310,13 +368,21 @@ jobs:
           sudo apt-get install -y g++-riscv64-linux-gnu libc6-dev-arm64-cross
       - name: Get source
         uses: actions/checkout@v6
+      - *set-up-ccache
+
       - name: Build binary
         env:
+          CMAKE_C_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.executable }}
+          CMAKE_CXX_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.executable }}
           CMAKE_GENERATOR: Ninja
           CMAKE_PARAMS: |
             -D CMAKE_TOOLCHAIN_FILE=../toolchains/riscv64-linux-gnu.cmake
             -D CMAKE_EXE_LINKER_FLAGS_INIT=-static-libstdc++
         run: ci/build-binary
+      - *show-ccache-statistics
+
+      - *save-compilation-cache
+
       - name: Upload binary
         uses: actions/upload-artifact@v7
         with:
@@ -337,13 +403,21 @@ jobs:
           sudo apt-get install -y g++-s390x-linux-gnu libc6-dev-arm64-cross
       - name: Get source
         uses: actions/checkout@v6
+      - *set-up-ccache
+
       - name: Build binary
         env:
+          CMAKE_C_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.executable }}
+          CMAKE_CXX_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.executable }}
           CMAKE_GENERATOR: Ninja
           CMAKE_PARAMS: |
             -D CMAKE_TOOLCHAIN_FILE=../toolchains/s390x-linux-gnu.cmake
             -D CMAKE_EXE_LINKER_FLAGS_INIT=-static-libstdc++
         run: ci/build-binary
+      - *show-ccache-statistics
+
+      - *save-compilation-cache
+
       - name: Upload binary
         uses: actions/upload-artifact@v7
         with:
@@ -369,19 +443,30 @@ jobs:
             --setopt=install_weak_deps=False \
             --setopt=tsflags=nodocs \
             cmake \
+            curl \
             gcc \
             gcc-c++ \
             gcc-toolset-11 \
             git \
-            ninja-build
+            gzip \
+            ninja-build \
+            tar
       - name: Get source
         uses: actions/checkout@v6
+      - *set-up-ccache
+
       - name: Build binary
         env:
+          CMAKE_C_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.executable }}
+          CMAKE_CXX_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.executable }}
           CMAKE_GENERATOR: Ninja
           CMAKE_PARAMS: -D CMAKE_EXE_LINKER_FLAGS_INIT=-static-libstdc++
         run: |
           scl enable gcc-toolset-11 ci/build-binary
+      - *show-ccache-statistics
+
+      - *save-compilation-cache
+
       - name: Upload binary
         uses: actions/upload-artifact@v7
         with:
@@ -435,18 +520,45 @@ jobs:
           else
             echo "trigger-build=false" >> $GITHUB_OUTPUT
           fi
+      - name: Set up ccache
+        if: ${{ !matrix.qemu || steps.trigger.outputs.trigger-build == 'true' }}
+        id: ccache
+        uses: ./.github/actions/set-up-ccache
+        with:
+          key: linux-${{ matrix.arch }}-musl-static
+          platform: linux-${{ matrix.arch }}-musl-static
+
       - name: Build in Alpine container
         if: ${{ !matrix.qemu || steps.trigger.outputs.trigger-build == 'true' }}
+        env:
+          CMAKE_C_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.executable }}
+          CMAKE_CXX_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.executable }}
+          CCACHE: ${{ steps.ccache.outputs.executable }}
         run: |
-          docker run --rm  -v "$PWD:/work" -w /work \
+          mkdir -p "$CCACHE_DIR"
+          tool_dir=$(dirname "$CCACHE")
+          docker run --rm -v "$PWD:/work" -w /work \
+            -v "$tool_dir:$tool_dir:ro" \
+            -v "$CCACHE_DIR:$CCACHE_DIR" \
             ${{ matrix.qemu && format('--platform linux/{0}', matrix.arch) || '' }} \
+            -e CCACHE_BASEDIR=/work \
+            -e CCACHE_DIR \
+            -e CCACHE_MAXSIZE \
+            -e CCACHE_COMPILERCHECK \
+            -e CCACHE_COMPRESSLEVEL \
+            -e CMAKE_C_COMPILER_LAUNCHER \
+            -e CMAKE_CXX_COMPILER_LAUNCHER \
             -e GITHUB_REF \
             -e GITHUB_REF_NAME \
             -e GITHUB_SHA \
             alpine:3.23 sh -c '
-              apk add --no-cache bash cmake g++ gcc git hiredis-dev make ninja xxhash-dev zstd-dev
+              apk add --no-cache bash cmake g++ gcc git make ninja xxhash-dev zstd-dev
               CMAKE_GENERATOR=Ninja CMAKE_PARAMS="-D CMAKE_EXE_LINKER_FLAGS_INIT=-static" ci/build-binary
           '
+      - *show-ccache-statistics
+
+      - *save-compilation-cache
+
       - name: Upload binary
         uses: actions/upload-artifact@v7
         with:
@@ -463,8 +575,17 @@ jobs:
     steps:
       - name: Get source
         uses: actions/checkout@v6
+      - *set-up-ccache
+
       - name: Build Darwin binary
+        env:
+          CMAKE_C_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.executable }}
+          CMAKE_CXX_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.executable }}
         run: ci/build-darwin-binary
+      - *show-ccache-statistics
+
+      - *save-compilation-cache
+
       - name: Upload binary
         uses: actions/upload-artifact@v7
         with:
@@ -473,16 +594,14 @@ jobs:
           retention-days: 3
 
   build_windows_binary:
+    env:
+      CCACHE_KEY: windows-binary-${{ matrix.toolchain }}
     timeout-minutes: 30
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         include:
-          # - arch: i686
-          #   toolchain: i686-w64-mingw32-posix
-          #   apt_get: g++-mingw-w64-i686-posix
-
           - arch: x86_64
             toolchain: x86_64-w64-mingw32-posix
             apt_get: g++-mingw-w64-x86-64-posix
@@ -512,10 +631,18 @@ jobs:
           echo /opt/llvm-mingw/bin >>${GITHUB_PATH}
       - name: Get source
         uses: actions/checkout@v6
+      - *set-up-ccache
+
       - name: Build binary
         env:
+          CMAKE_C_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.executable }}
+          CMAKE_CXX_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.executable }}
           CMAKE_PARAMS: -D CMAKE_TOOLCHAIN_FILE=../toolchains/${{ matrix.toolchain }}.cmake
         run: ci/build-binary
+      - *show-ccache-statistics
+
+      - *save-compilation-cache
+
       - name: Upload binary
         uses: actions/upload-artifact@v7
         with:
@@ -524,6 +651,8 @@ jobs:
           retention-days: 3
 
   windows_tests:
+    env:
+      CCACHE_KEY: windows-tests-windows-2022-msvc-x64
     timeout-minutes: 30
     name: Windows integration tests
     runs-on: windows-2022
@@ -539,11 +668,16 @@ jobs:
       - name: Install pytest
         run: pip install pytest
 
+      - *set-up-ccache
+
       - name: Build ccache
+        env:
+          CMAKE_C_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.executable }}
+          CMAKE_CXX_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.executable }}
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          cmake -S . -B build-win64 -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake -S . -B build-win64 -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_DEFAULT_CMP0141=NEW -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
           ninja -C build-win64 ccache
 
       - name: Run MSVC integration tests
@@ -552,7 +686,13 @@ jobs:
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
           pytest test/msvc/ --ccache "%GITHUB_WORKSPACE%/build-win64/ccache.exe" -v
 
+      - *show-ccache-statistics
+
+      - *save-compilation-cache
+
   specific_tests:
+    env:
+      CCACHE_KEY: specific-${{ matrix.os }}-${{ matrix.name }}
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -564,7 +704,7 @@ jobs:
             CC: gcc
             CXX: g++
             CMAKE_PARAMS: -DCMAKE_BUILD_TYPE=Debug
-            apt_get: elfutils libhiredis-dev libzstd-dev
+            apt_get: elfutils libzstd-dev
 
           - name: Linux GCC 32-bit
             os: ubuntu-22.04
@@ -582,7 +722,7 @@ jobs:
             CXX: g++
             CMAKE_PARAMS: -DCMAKE_BUILD_TYPE=CI
             CUDA: 11.7.0-1
-            apt_get: elfutils libhiredis-dev libzstd-dev
+            apt_get: elfutils libzstd-dev
 
           - name: Linux MinGW 32-bit
             os: ubuntu-24.04
@@ -596,34 +736,23 @@ jobs:
             RUN_TESTS: unittest-in-wine
             apt_get: elfutils mingw-w64 wine
 
-          - name: Windows VS2022 32-bit
-            os: windows-2022
-            msvc_arch: x64_x86
-            allow_test_failures: true  # For now, don't fail the build on failure
-            CC: cl
-            CXX: cl
-            CMAKE_GENERATOR: Visual Studio 17 2022
-            CMAKE_PARAMS: -DCMAKE_BUILD_TYPE=CI -A Win32
-            TEST_CC: clang -target i686-pc-windows-msvc
-
           - name: Windows VS2022 64-bit
             os: windows-2022
             msvc_arch: x64
-            allow_test_failures: true  # For now, don't fail the build on failure
             CC: cl
             CXX: cl
-            CMAKE_GENERATOR: Visual Studio 17 2022
-            CMAKE_PARAMS: -DCMAKE_BUILD_TYPE=CI -A x64
+            CMAKE_GENERATOR: Ninja
+            CMAKE_PARAMS: -DCMAKE_BUILD_TYPE=CI -DCMAKE_POLICY_DEFAULT_CMP0141=NEW -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
             TEST_CC: clang -target x86_64-pc-windows-msvc
 
           - name: Windows VS2026 ARM64
             os: windows-11-vs2026-arm
             msvc_arch: ARM64
-            allow_test_failures: true  # For now, don't fail the build on failure
+            allow_test_failures: true  # Test scripts occasionally crash with a segfault
             CC: cl
             CXX: cl
-            CMAKE_GENERATOR: Visual Studio 18 2026
-            CMAKE_PARAMS: -DCMAKE_BUILD_TYPE=CI -DZSTD_FROM_INTERNET=ON -DHIREDIS_FROM_INTERNET=ON -A ARM64
+            CMAKE_GENERATOR: Ninja
+            CMAKE_PARAMS: -DCMAKE_BUILD_TYPE=CI -DZSTD_FROM_INTERNET=ON -DCMAKE_POLICY_DEFAULT_CMP0141=NEW -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
             TEST_CC: clang -target aarch64-pc-windows-msvc
 
           - name: Clang address & UB sanitizer
@@ -632,15 +761,15 @@ jobs:
             CXX: clang++
             CMAKE_PARAMS: -DCMAKE_BUILD_TYPE=CI -DENABLE_SANITIZER_ADDRESS=ON -DENABLE_SANITIZER_UNDEFINED_BEHAVIOR=ON
             ASAN_OPTIONS: detect_leaks=0
-            apt_get: elfutils libzstd-dev libhiredis-dev
+            apt_get: elfutils libzstd-dev
 
           - name: Clang static analyzer
-            os: ubuntu-22.04
+            os: ubuntu-24.04
             CC: clang
             CXX: clang++
             CMAKE_PREFIX: scan-build
             RUN_TESTS: none
-            apt_get: libzstd-dev libhiredis-dev
+            apt_get: clang-tools libzstd-dev
 
           - name: Linux binary
             os: ubuntu-22.04
@@ -648,14 +777,14 @@ jobs:
             CXX: g++
             SPECIAL: build-and-verify-package
             CMAKE_PARAMS: -DCMAKE_BUILD_TYPE=Release
-            apt_get: elfutils libzstd-dev libhiredis-dev
+            apt_get: elfutils libzstd-dev
 
           - name: Source package
             os: ubuntu-22.04
             CC: gcc
             CXX: g++
             SPECIAL: build-and-verify-source-package
-            apt_get: elfutils libzstd-dev libhiredis-dev asciidoctor
+            apt_get: elfutils libzstd-dev asciidoctor
 
           - name: Clang-Tidy
             os: ubuntu-22.04
@@ -663,7 +792,7 @@ jobs:
             CXX: clang++-13
             RUN_TESTS: none
             CMAKE_PARAMS: -DENABLE_CLANG_TIDY=ON -DCLANGTIDY=/usr/bin/clang-tidy-13
-            apt_get: libzstd-dev libhiredis-dev clang-13 clang-tidy-13
+            apt_get: libzstd-dev clang-13 clang-tidy-13
 
     steps:
       - name: Get source
@@ -681,9 +810,48 @@ jobs:
 
       - name: Prepare Windows environment (Visual Studio)
         if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1.13.0
-        with:
-          arch: ${{ matrix.msvc_arch }}
+        shell: powershell
+        env:
+          MSVC_ARCH: ${{ matrix.msvc_arch }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -prerelease -property installationPath
+          if (!$vs) {
+            throw 'Visual Studio installation not found'
+          }
+          $vcvars = "$vs\VC\Auxiliary\Build\vcvarsall.bat"
+          if (!(Test-Path -LiteralPath $vcvars)) {
+            throw "Visual Studio setup script not found: $vcvars"
+          }
+
+          # Separate setup diagnostics from the environment dump. vcvarsall can
+          # report errors while returning success, so check its output as well.
+          $marker = [Guid]::NewGuid().ToString()
+          # Keep && adjacent to the marker: cmd includes preceding spaces in echo output.
+          $output = @(& cmd /d /c "call `"$vcvars`" $env:MSVC_ARCH && echo $marker&& set")
+          $exitCode = $LASTEXITCODE
+          $separator = [Array]::IndexOf($output, $marker)
+          if ($separator -lt 0) {
+            $output | Write-Host
+            throw 'Failed to initialize the Visual Studio environment'
+          }
+          $diagnostics = @($output | Select-Object -First $separator)
+          $diagnostics | Write-Host
+          if ($exitCode -ne 0 -or ($diagnostics -match '^\[ERROR.*\]')) {
+            throw 'Failed to initialize the Visual Studio environment'
+          }
+          foreach ($line in ($output | Select-Object -Skip ($separator + 1))) {
+            if ($line -match '^([^=]+)=(.*)$') {
+              $name, $value = $matches[1], $matches[2]
+              if ([Environment]::GetEnvironmentVariable($name) -cne $value) {
+                if ($name -in @('PATH', 'INCLUDE', 'LIB', 'LIBPATH')) {
+                  $value = ($value -split ';' | Select-Object -Unique) -join ';'
+                }
+                "$name=$value" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+              }
+            }
+          }
 
       - name: Prepare Windows environment (Clang)
         if: runner.os == 'Windows'
@@ -702,6 +870,8 @@ jobs:
           "Path=${HOME}\opt\llvm\bin;${env:Path}" | `
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
+      - *set-up-ccache
+
       - name: Build and test
         id: build-and-test
         env:
@@ -711,7 +881,10 @@ jobs:
           CCACHE_LOC: ${{ matrix.CCACHE_LOC }}
           CFLAGS: ${{ matrix.CFLAGS }}
           CMAKE_GENERATOR: ${{ matrix.CMAKE_GENERATOR }}
+          CMAKE_C_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.executable }}
+          CMAKE_CXX_COMPILER_LAUNCHER: ${{ steps.ccache.outputs.executable }}
           CMAKE_PARAMS: ${{ matrix.CMAKE_PARAMS }}
+          CMAKE_PREFIX: ${{ matrix.CMAKE_PREFIX }}
           CXX: ${{ matrix.CXX }}
           CXXFLAGS: ${{ matrix.CXXFLAGS }}
           EXTRA_CMAKE_BUILD_FLAGS: ${{ matrix.EXTRA_CMAKE_BUILD_FLAGS }}
@@ -720,13 +893,39 @@ jobs:
           SPECIAL: ${{ matrix.SPECIAL }}
           TEST_CC: ${{ matrix.TEST_CC }}
         run: |
+          if [ "$CMAKE_PREFIX" = scan-build ]; then
+            # Cache compilation inside the analyzer wrapper so analysis also
+            # runs when the object file is retrieved from the cache.
+            compiler_dir=$(mktemp -d "$RUNNER_TEMP/ccache-compilers.XXXXXX")
+            for compiler in CC CXX; do
+              wrapper="$compiler_dir/$compiler"
+              printf '#!/bin/bash\nexec %q %q "$@"\n' \
+                "$CMAKE_C_COMPILER_LAUNCHER" "$(command -v "${!compiler}")" > "$wrapper"
+              chmod +x "$wrapper"
+            done
+            export CCC_CC="$compiler_dir/CC"
+            export CCC_CXX="$compiler_dir/CXX"
+            unset CMAKE_C_COMPILER_LAUNCHER CMAKE_CXX_COMPILER_LAUNCHER
+            export CMAKE_PREFIX="scan-build -v --status-bugs -o $RUNNER_TEMP/scan-build"
+          fi
           rc=0
           ci/build || rc=$?
-          echo "exit_status=$rc" >> $GITHUB_OUTPUT
+          echo "exit_status=$rc" >> "$GITHUB_OUTPUT"
           exit $rc
         # CTest exits with return code 8 on test failure.
         continue-on-error: ${{ matrix.allow_test_failures == true &&
           steps.build-and-test.outputs.exit_status == 8 }}
+
+      - *show-ccache-statistics
+
+      - *save-compilation-cache
+
+      - name: Upload Clang static analyzer reports
+        if: always() && matrix.CMAKE_PREFIX == 'scan-build'
+        uses: actions/upload-artifact@v7
+        with:
+          name: clang-static-analyzer-reports
+          path: ${{ runner.temp }}/scan-build
 
       - name: Collect testdir from failed tests
         if: failure() || steps.build-and-test.outcome == 'failure'

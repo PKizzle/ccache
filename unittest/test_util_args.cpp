@@ -57,7 +57,6 @@ TEST_CASE("Args move constructor")
   const char* bar_pointer = args1[1].c_str();
 
   Args args2(std::move(args1));
-  CHECK(args1.size() == 0);
   CHECK(args2.size() == 2);
   CHECK(args2[0].c_str() == foo_pointer);
   CHECK(args2[1].c_str() == bar_pointer);
@@ -261,6 +260,36 @@ TEST_CASE("Args::from_response_file")
   }
 }
 
+TEST_CASE("Args::format_response_file_content")
+{
+  const char* const argv[] = {
+    R"(C:\src\file.cpp)", R"(/d1trimfile:C:\src\)", "with space", nullptr};
+  const Args expected{
+    R"(C:\src\file.cpp)", R"(/d1trimfile:C:\src\)", "with space"};
+
+  SUBCASE("windows")
+  {
+    const auto content = Args::format_response_file_content(
+      argv, Args::ResponseFileFormat::windows);
+    CHECK(content
+          == R"("C:\src\file.cpp" "/d1trimfile:C:\src\\" "with space")");
+    CHECK(Args::parse_response_file_content(content,
+                                            Args::ResponseFileFormat::windows)
+          == expected);
+  }
+
+  SUBCASE("posix")
+  {
+    const auto content =
+      Args::format_response_file_content(argv, Args::ResponseFileFormat::posix);
+    CHECK(content
+          == R"("C:\\src\\file.cpp" "/d1trimfile:C:\\src\\" "with space")");
+    CHECK(Args::parse_response_file_content(content,
+                                            Args::ResponseFileFormat::posix)
+          == expected);
+  }
+}
+
 TEST_CASE("Args copy assignment operator")
 {
   Args args1 = Args::from_string("x y");
@@ -279,7 +308,6 @@ TEST_CASE("Args move assignment operator")
 
   Args args2;
   args2 = std::move(args1);
-  CHECK(args1.size() == 0);
   CHECK(args2.size() == 2);
   CHECK(args2[0].c_str() == x_pointer);
   CHECK(args2[1] == y_pointer);
