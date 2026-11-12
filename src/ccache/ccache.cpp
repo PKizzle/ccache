@@ -2278,7 +2278,7 @@ hash_argument(const Context& ctx,
 
   if (arg.starts_with("-specs=") || arg == "-specs"
       || arg.starts_with("--specs=") || arg == "--specs") {
-    auto [_option, specs] = util::split_once_into_views(arg, '=');
+    auto specs = util::split_once_into_views(arg, '=').second;
     if (!specs) {
       if (i + 1 >= args.size()) {
         LOG("Missing argument for \"{}\"", args[i]);
@@ -2328,7 +2328,7 @@ hash_argument(const Context& ctx,
     // Since there doesn't seem to be an easy way to query which directory is
     // used we only support names with a slash for now.
 
-    auto [_option, config] = util::split_once_into_views(arg, '=');
+    auto config = util::split_once_into_views(arg, '=').second;
     if (!config) {
       if (i + 1 >= args.size()) {
         LOG("Missing argument for \"{}\"", args[i]);
@@ -2392,7 +2392,7 @@ hash_argument(const Context& ctx,
   static constexpr auto warning_suppression_mappings =
     "--warning-suppression-mappings="sv;
   if (arg.starts_with(warning_suppression_mappings)) {
-    auto [_option, path] = util::split_once_into_views(arg, '=');
+    const auto path = util::split_once_into_views(arg, '=').second;
     hash.hash_delimiter(warning_suppression_mappings);
     if (auto r = hash.hash_file(*path); !r) {
       LOG("Failed to hash {}: {}", *path, r.error());
