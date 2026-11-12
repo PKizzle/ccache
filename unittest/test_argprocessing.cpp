@@ -1556,7 +1556,7 @@ TEST_CASE("-Xarch_device with -Xarch_x86_64 is too hard")
   CHECK(result.error() == Statistic::unsupported_compiler_option);
 }
 
-TEST_CASE("-clang: is too hard")
+TEST_CASE("-clang: with a non-option argument is unsupported")
 {
   TestContext test_context;
   Context ctx;
@@ -1586,7 +1586,7 @@ TEST_CASE("-clang: options are processed after all other options")
   ctx.config.set_compiler_type(CompilerType::clang_cl);
   REQUIRE(util::write_file("foo.c", ""));
 
-  SUBCASE("joined value")
+  SUBCASE("Attached value")
   {
     // As emitted by CMake 4.4 with Ninja.
     ctx.orig_args = Args::from_string(
@@ -1603,7 +1603,7 @@ TEST_CASE("-clang: options are processed after all other options")
           == "-clang:-MD -clang:-MTfoo.obj -clang:-MFfoo.d");
   }
 
-  SUBCASE("value in the next -clang: option")
+  SUBCASE("Separate value in the next -clang: option")
   {
     ctx.orig_args = Args::from_string(
       "clang-cl -clang:-MD -clang:-MT -clang:foo.obj -clang:-MF -clang:foo.d"
@@ -1616,7 +1616,7 @@ TEST_CASE("-clang: options are processed after all other options")
           == "-clang:-MD -clang:-MT -clang:foo.obj -clang:-MF -clang:foo.d");
   }
 
-  SUBCASE("/clang: spelling")
+  SUBCASE("Slash spelling")
   {
     ctx.orig_args = Args::from_string(
       "clang-cl /clang:-MD /clang:-MF /clang:foo.d /Fofoo.obj -c foo.c");
@@ -1627,7 +1627,7 @@ TEST_CASE("-clang: options are processed after all other options")
           == "-clang:-MD -clang:-MF -clang:foo.d");
   }
 
-  SUBCASE("missing value")
+  SUBCASE("Missing argument")
   {
     ctx.orig_args = Args::from_string("clang-cl -c foo.c -clang:-MF");
     const auto result = process_args(ctx);
@@ -1635,7 +1635,7 @@ TEST_CASE("-clang: options are processed after all other options")
     CHECK(result.error() == Statistic::bad_compiler_arguments);
   }
 
-  SUBCASE("order")
+  SUBCASE("Command line order")
   {
     ctx.orig_args =
       Args::from_string("clang-cl -clang:-DX=2 -c foo.c -DX=1 /Fofoo.obj");
@@ -1645,7 +1645,7 @@ TEST_CASE("-clang: options are processed after all other options")
           == "clang-cl -DX=1 -clang:-DX=2");
   }
 
-  SUBCASE("generic clang driver options")
+  SUBCASE("Generic clang driver options")
   {
     ctx.orig_args = Args::from_string(
       "clang-cl /clang:-fno-math-errno /clang:-ffp-contract=off -c foo.c");
@@ -1655,7 +1655,7 @@ TEST_CASE("-clang: options are processed after all other options")
           == "clang-cl -clang:-fno-math-errno -clang:-ffp-contract=off");
   }
 
-  SUBCASE("rewritten options keep the prefix")
+  SUBCASE("Rewritten options keep the prefix")
   {
     ctx.config.set_base_dir(get_root());
     ctx.orig_args = Args::from_string(
