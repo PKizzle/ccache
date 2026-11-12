@@ -2246,7 +2246,11 @@ hash_argument(const Context& ctx,
     }
   }
 
-  if (ctx.args_info.generating_dependencies) {
+  // For MSVC-style compilers, only options forwarded by clang-cl's /clang:
+  // can be dependency options, -MT is the static runtime library option.
+  if (ctx.args_info.generating_dependencies
+      && (!ctx.config.is_compiler_group_msvc()
+          || args[i].starts_with("-clang:"))) {
     if (arg.starts_with("-Wp,")) {
       // Skip the dependency filename since it doesn't impact the output.
       if (arg.starts_with("-Wp,-MD,")
@@ -2334,7 +2338,7 @@ hash_argument(const Context& ctx,
         LOG("Missing argument for \"{}\"", args[i]);
         return tl::unexpected(Statistic::bad_compiler_arguments);
       }
-      config = args[i + 1];
+      config = without_clang_cl_prefix(args[i + 1]);
       i++;
     }
 

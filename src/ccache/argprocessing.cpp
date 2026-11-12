@@ -98,7 +98,7 @@ public:
 
   // <arg> of clang-cl /clang:<arg> options in command line order.
   util::Args clang_cl_forwarded_args;
-  // Added to every argument while processing clang_cl_forwarded_args.
+  // Prepended to every argument the add_*_arg methods add.
   std::string_view arg_prefix;
 
   std::string explicit_language;             // As specified with -x.
@@ -622,9 +622,7 @@ process_option_arg(const Context& ctx,
 
   if (ctx.config.compiler_type() == CompilerType::clang_cl
       && arg.starts_with("-clang:")) {
-    // clang-cl's /clang:<arg> option forwards any arg to the clang driver.
-    // Also, they are treated as if they were passed at the end of the command
-    // line, so process them last, see process_clang_cl_forwarded_args.
+    // Processed last, see process_clang_cl_forwarded_args.
     state.clang_cl_forwarded_args.push_back(arg.substr(7));
     return Statistic::none;
   }
@@ -1442,7 +1440,7 @@ process_option_arg(const Context& ctx,
 
   // Input charset needs to be handled specially.
   if (arg.starts_with("-finput-charset=")) {
-    state.input_charset_option = args[i];
+    state.input_charset_option = FMT("{}{}", state.arg_prefix, args[i]);
     return Statistic::none;
   }
 
@@ -1790,10 +1788,10 @@ process_arg(const Context& ctx,
   return Statistic::none;
 }
 
-// clang-cl passes the <arg> of /clang:<arg> to the clang driver after all other
-// options, so an option's separate value is the next /clang:<arg>. Process them
-// last, as clang driver options, and keep the prefix on everything added to the
-// command lines.
+// clang-cl passes the <arg>s of all /clang:<arg> options to the clang driver as
+// one list after all other options, so an option's separate value is the next
+// /clang:<arg>. Process them last as clang options and prefix everything added
+// to the command lines with "-clang:".
 std::optional<Statistic>
 process_clang_cl_forwarded_args(Context& ctx,
                                 ArgsInfo& args_info,
@@ -1807,8 +1805,14 @@ process_clang_cl_forwarded_args(Context& ctx,
     const auto statistic =
       process_option_arg(ctx, args_info, ctx.config, args, i, state);
     if (!statistic) {
-      LOG("Compiler option -clang:{} is unsupported", args[i]);
-      error = Statistic::unsupported_compiler_option;
+      // Like process_arg: a value that isn't a file is assumed to be an option,
+      // while another input file is unsupported.
+      if (DirEntry(args[i]).is_regular_file()) {
+        LOG("Input file -clang:{} is unsupported", args[i]);
+        error = Statistic::unsupported_compiler_option;
+      } else {
+        state.add_common_arg(args[i]);
+      }
     } else if (*statistic != Statistic::none) {
       error = statistic;
     }

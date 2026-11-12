@@ -1556,22 +1556,23 @@ TEST_CASE("-Xarch_device with -Xarch_x86_64 is too hard")
   CHECK(result.error() == Statistic::unsupported_compiler_option);
 }
 
-TEST_CASE("-clang: with a non-option argument is unsupported")
+TEST_CASE("-clang: with an input file is unsupported")
 {
   TestContext test_context;
   Context ctx;
 
   ctx.config.set_compiler_type(CompilerType::clang_cl);
   REQUIRE(util::write_file("foo.c", ""));
+  REQUIRE(util::write_file("bar.c", ""));
 
   SUBCASE("-clang:")
   {
-    ctx.orig_args = Args::from_string("clang -c foo.c -clang:bar");
+    ctx.orig_args = Args::from_string("clang-cl -c foo.c -clang:bar.c");
   }
 
   SUBCASE("/clang:")
   {
-    ctx.orig_args = Args::from_string("clang -c foo.c /clang:bar");
+    ctx.orig_args = Args::from_string("clang-cl -c foo.c /clang:bar.c");
   }
 
   const auto result = process_args(ctx);
@@ -1601,6 +1602,9 @@ TEST_CASE("-clang: options are processed after all other options")
           == "clang-cl -clang:-std=c++23");
     CHECK(result->extra_args_to_hash.to_string()
           == "-clang:-MD -clang:-MTfoo.obj -clang:-MFfoo.d");
+    CHECK(result->compiler_args.to_string()
+          == "clang-cl -clang:-std=c++23 -clang:-MD -clang:-MTfoo.obj"
+             " -clang:-MFfoo.d -fcolor-diagnostics -c");
   }
 
   SUBCASE("Separate value in the next -clang: option")
@@ -1614,6 +1618,29 @@ TEST_CASE("-clang: options are processed after all other options")
     CHECK(ctx.args_info.dependency_target == "foo.obj");
     CHECK(result->extra_args_to_hash.to_string()
           == "-clang:-MD -clang:-MT -clang:foo.obj -clang:-MF -clang:foo.d");
+    CHECK(result->compiler_args.to_string()
+          == "clang-cl -clang:-MD -clang:-MT -clang:foo.obj -clang:-MF"
+             " -clang:foo.d -fcolor-diagnostics -c");
+  }
+
+  SUBCASE("Value that isn't a file")
+  {
+    ctx.orig_args = Args::from_string(
+      "clang-cl /clang:-target /clang:x86_64-pc-windows-msvc -c foo.c");
+    const auto result = process_args(ctx);
+    REQUIRE(result);
+    CHECK(result->preprocessor_args.to_string()
+          == "clang-cl -clang:-target -clang:x86_64-pc-windows-msvc");
+  }
+
+  SUBCASE("Input charset")
+  {
+    ctx.orig_args =
+      Args::from_string("clang-cl /clang:-finput-charset=UTF-8 -c foo.c");
+    const auto result = process_args(ctx);
+    REQUIRE(result);
+    CHECK(result->preprocessor_args.to_string()
+          == "clang-cl -clang:-finput-charset=UTF-8");
   }
 
   SUBCASE("Slash spelling")
